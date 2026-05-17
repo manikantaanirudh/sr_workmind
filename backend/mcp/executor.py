@@ -17,7 +17,12 @@ import datetime as dt
 import logging
 from pathlib import Path
 
-from backend.mcp.mcp_client import execute_sql_via_mcp, mcp_tools_list
+from backend.config import settings
+from backend.mcp.mcp_client import (
+    _execute_sql_via_sql_api,
+    execute_sql_via_mcp,
+    mcp_tools_list,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +38,11 @@ def validate_via_mcp() -> str:
     Raises:
         RuntimeError: If the MCP server is unreachable or the tool is missing.
     """
+    if not settings.snowflake_pat.strip():
+        raise RuntimeError(
+            "SNOWFLAKE_PAT is not set. Add it in Render → sr-workmind-backend → Environment."
+        )
+
     try:
         tools = mcp_tools_list()
         tool_names = [t.get("name", "") for t in tools]
@@ -46,7 +56,20 @@ def validate_via_mcp() -> str:
             f"Passed - Snowflake hosted MCP Server verified | "
             f"SQL tool: {sql_tool} | Tools: {', '.join(tool_names[:8])}"
         )
-    except RuntimeError:
+    except RuntimeError as exc:
+        err = str(exc)
+        auth_failed = "401" in err or "394400" in err
+        if auth_failed and settings.snowflake_mcp_sql_api_fallback:
+            try:
+                _execute_sql_via_sql_api("SELECT 1 AS n")
+                return (
+                    "Passed - Snowflake SQL API verified (PAT ok); "
+                    "MCP tools/list returned 401 — queries will use SQL API fallback"
+                )
+            except RuntimeError as sql_exc:
+                raise RuntimeError(
+                    f"{err}\n\nSQL API probe also failed: {sql_exc}"
+                ) from sql_exc
         raise
     except Exception as exc:
         raise RuntimeError(f"MCP Server health check failed: {exc}") from exc

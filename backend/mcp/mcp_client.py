@@ -166,6 +166,12 @@ def _execute_sql_via_sql_api(sql: str) -> tuple[list[str], list[list[Any]]]:
                 )
             payload = _poll_sql_api_statement(client, status_path)
 
+        elif response.status_code == 401:
+            body = response.text[:800]
+            raise RuntimeError(
+                f"Snowflake SQL API authentication failed (401): {body}\n"
+                "Fix SNOWFLAKE_PAT in Render Environment (no quotes, full token)."
+            )
         elif response.status_code != 200:
             raise RuntimeError(
                 f"Snowflake SQL API error ({response.status_code}): {response.text[:500]}"
@@ -212,11 +218,19 @@ def _send_rpc(payload: dict, timeout: float = 120.0) -> dict:
 
     # Surface clear errors for common failure modes
     if response.status_code == 401:
-        # Surface the raw response to help debug why the PAT is rejected
+        body = response.text[:800]
+        hint = ""
+        if "394400" in body or "invalid" in body.lower():
+            pat_len = len(settings.snowflake_pat)
+            hint = (
+                "\n\nSnowflake PAT rejected (394400 = invalid token). Check Render Environment:\n"
+                f"  - SNOWFLAKE_PAT is set (current length: {pat_len}, expect ~200+ chars)\n"
+                "  - No quotes or spaces around the token value\n"
+                "  - Token is for role mcp_client_role and not expired\n"
+                "  - Network policy allows connections from Render (not only localhost)"
+            )
         raise RuntimeError(
-            f"MCP Server authentication failed (401).\n"
-            f"URL: {url}\n"
-            f"Raw Response: {response.text}"
+            f"MCP Server authentication failed (401).\nURL: {url}\nRaw Response: {body}{hint}"
         )
     if response.status_code == 403:
         raise RuntimeError(
@@ -405,6 +419,38 @@ def _execute_sql_via_mcp_tools(sql: str, clean_sql: str) -> tuple[list[str], lis
     )
 
 
+def probe_snowflake_connectivity() -> dict[str, Any]:
+    """Non-secret connectivity probe for /health/diagnostics."""
+    pat = settings.snowflake_pat
+    info: dict[str, Any] = {
+        "pat_configured": bool(pat),
+        "pat_length": len(pat),
+        "account": settings.snowflake_account,
+        "database": settings.snowflake_database,
+        "schema": settings.snowflake_schema,
+        "mcp_url": _build_mcp_url(),
+        "sql_api_fallback": settings.snowflake_mcp_sql_api_fallback,
+    }
+    if not pat:
+        info["mcp_tools_list"] = "skipped — SNOWFLAKE_PAT missing"
+        info["sql_api_select_1"] = "skipped — SNOWFLAKE_PAT missing"
+        return info
+
+    try:
+        tools = mcp_tools_list(force_refresh=True)
+        info["mcp_tools_list"] = f"ok ({len(tools)} tools)"
+    except Exception as exc:
+        info["mcp_tools_list"] = f"error: {exc}"
+
+    try:
+        _execute_sql_via_sql_api("SELECT 1 AS n")
+        info["sql_api_select_1"] = "ok"
+    except Exception as exc:
+        info["sql_api_select_1"] = f"error: {exc}"
+
+    return info
+
+
 def execute_sql_via_mcp(sql: str) -> tuple[list[str], list[list[Any]]]:
     """Execute SQL via Snowflake hosted MCP (tools/call), with SQL API fallback when needed."""
     global _last_snowflake_execution_mode
@@ -417,21 +463,31 @@ def execute_sql_via_mcp(sql: str) -> tuple[list[str], list[list[Any]]]:
     try:
         _last_snowflake_execution_mode = "mcp"
         return _execute_sql_via_mcp_tools(sql, clean_sql)
-    except SnowflakeMcpToolUnavailable as exc:
-        if settings.snowflake_mcp_sql_api_fallback and settings.snowflake_pat.strip():
+    except (SnowflakeMcpToolUnavailable, RuntimeError) as exc:
+        err = str(exc)
+        use_fallback = settings.snowflake_mcp_sql_api_fallback and settings.snowflake_pat.strip()
+        auth_or_parse = (
+            isinstance(exc, SnowflakeMcpToolUnavailable)
+            or "parsing" in err.lower()
+            or "401" in err
+            or "394400" in err
+        )
+        if use_fallback and auth_or_parse:
             logger.warning(
-                "Snowflake MCP sql_exec_tool failed (%s); executing via SQL API (same PAT).",
+                "Snowflake MCP path failed (%s); executing via SQL API (same PAT).",
                 exc,
             )
             _last_snowflake_execution_mode = "sql_api_fallback"
             return _execute_sql_via_sql_api(clean_sql)
-        warehouse = settings.snowflake_warehouse.strip() or "COMPUTE_WH"
-        raise RuntimeError(
-            f"{exc}\n\n"
-            "Snowflake hosted MCP sql_exec_tool cannot execute SQL on this account. "
-            "Ensure MODIFY + USAGE on the MCP server for the PAT role, warehouse in tool config, "
-            "or set SNOWFLAKE_MCP_SQL_API_FALLBACK=true to use SQL API with the same PAT."
-        ) from exc
+        if isinstance(exc, SnowflakeMcpToolUnavailable):
+            warehouse = settings.snowflake_warehouse.strip() or "COMPUTE_WH"
+            raise RuntimeError(
+                f"{exc}\n\n"
+                "Snowflake hosted MCP sql_exec_tool cannot execute SQL on this account. "
+                "Ensure MODIFY + USAGE on the MCP server for the PAT role, warehouse in tool config, "
+                "or set SNOWFLAKE_MCP_SQL_API_FALLBACK=true to use SQL API with the same PAT."
+            ) from exc
+        raise
 
 
 def _execute_fallback_sql(sql: str) -> tuple[list[str], list[list[Any]]]:

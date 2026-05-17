@@ -40,7 +40,8 @@ app = FastAPI(title="SR WorkMind — Multi-Platform MCP Edition", version="0.3.0
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.frontend_origin, "http://127.0.0.1:3000"],
+    allow_origins=settings.cors_origins,
+    allow_origin_regex=r"https://.*\.onrender\.com",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -95,6 +96,25 @@ def oauth_config(request: Request) -> dict[str, str | list[str]]:
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/health/diagnostics")
+def health_diagnostics() -> dict:
+    """Connectivity probe for Render debugging (no secrets returned)."""
+    from backend.mcp.mcp_client import probe_snowflake_connectivity
+
+    return {
+        "status": "ok",
+        "app_env": settings.app_env,
+        "llm_provider": settings.llm_provider,
+        "groq_configured": bool(settings.groq_api_key),
+        "frontend_origin": settings.frontend_origin,
+        "public_backend_url": settings.public_backend_url,
+        "snowflake": probe_snowflake_connectivity(),
+        "salesforce_authenticated": sf_is_authenticated(),
+        "docusign_authenticated": ds_is_authenticated(),
+        "token_storage_dir": settings.token_storage_dir,
+    }
 
 
 # ---------------------------------------------------------------------------

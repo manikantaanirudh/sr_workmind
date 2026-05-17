@@ -9,6 +9,14 @@ env_file = backend_dir / ".env"
 load_dotenv(env_file)
 
 
+def _clean_env(value: str) -> str:
+    """Strip whitespace and surrounding quotes (common when pasting into Render UI)."""
+    cleaned = value.strip()
+    if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in {'"', "'"}:
+        cleaned = cleaned[1:-1].strip()
+    return cleaned
+
+
 @dataclass
 class Settings:
     app_env: str = os.getenv("APP_ENV", "dev")
@@ -94,6 +102,33 @@ class Settings:
         os.getenv("DOCUSIGN_REQUIRE_HUMAN_APPROVAL", "true").strip().lower()
         in {"1", "true", "yes", "on"}
     )
+
+    def __post_init__(self) -> None:
+        self.snowflake_pat = _clean_env(self.snowflake_pat)
+        self.snowflake_account = _clean_env(self.snowflake_account)
+        self.snowflake_database = _clean_env(self.snowflake_database)
+        self.snowflake_schema = _clean_env(self.snowflake_schema)
+        self.snowflake_warehouse = _clean_env(self.snowflake_warehouse)
+        self.snowflake_role = _clean_env(self.snowflake_role)
+        self.groq_api_key = _clean_env(self.groq_api_key)
+        self.salesforce_consumer_key = _clean_env(self.salesforce_consumer_key)
+        self.frontend_origin = _clean_env(self.frontend_origin)
+
+    @property
+    def cors_origins(self) -> list[str]:
+        """Origins allowed for browser calls to the backend API."""
+        origins = {
+            self.frontend_origin,
+            "http://127.0.0.1:3000",
+            "http://localhost:3000",
+            "https://sr-workmind-frontend.onrender.com",
+        }
+        extra = os.getenv("CORS_EXTRA_ORIGINS", "")
+        for item in extra.split(","):
+            item = item.strip()
+            if item:
+                origins.add(item)
+        return [o for o in origins if o]
 
 
 settings = Settings()

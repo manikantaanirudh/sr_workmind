@@ -30,14 +30,22 @@ async function proxy(request: NextRequest, pathSegments: string[]) {
   }
 
   const controller = new AbortController();
-  const timeoutMs = 120_000;
+  const timeoutMs = 180_000;
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
-  try {
-    const upstream = await fetch(target, {
+  const fetchUpstream = () =>
+    fetch(target, {
       ...init,
       signal: controller.signal,
     });
+
+  try {
+    let upstream = await fetchUpstream();
+    // Render free tier: backend may 502 while waking — retry once after a short pause.
+    if (upstream.status === 502 || upstream.status === 503) {
+      await new Promise((resolve) => setTimeout(resolve, 8000));
+      upstream = await fetchUpstream();
+    }
 
     if (upstream.status >= 300 && upstream.status < 400) {
       const location = upstream.headers.get("location");
