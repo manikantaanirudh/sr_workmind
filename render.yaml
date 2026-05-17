@@ -18,9 +18,11 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -r backend/requirements.txt
-    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    startCommand: bash scripts/render-backend-start.sh
     healthCheckPath: /health
     envVars:
+      - key: PYTHONPATH
+        value: .
       - key: PYTHON_VERSION
         value: "3.12.8"
       - key: APP_ENV

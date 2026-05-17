@@ -17,7 +17,6 @@ import time
 from typing import Any
 
 import httpx
-import snowflake.connector
 
 from backend.config import settings
 from backend.mcp.mcp_protocol import decode_rpc_response
