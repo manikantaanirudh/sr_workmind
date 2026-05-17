@@ -85,6 +85,12 @@ def _find_identifier_after(tokens: list[str], anchor: str, skip_words: set[str],
 
 
 def _extract_table_hint(prompt: str, action_hint: str) -> str | None:
+    lowered = prompt.lower()
+    if "netflix_table" in lowered or "netflix table" in lowered:
+        return "NETFLIX_TABLE"
+    if "netflix" in lowered:
+        return "NETFLIX_TABLE"
+
     normalized = _normalize_prompt_text(prompt).lower()
     tokens = normalized.split()
     if not tokens:
@@ -190,7 +196,7 @@ def _detect_platform(prompt: str) -> str:
         return "docusign"
     if "salesforce" in text or "sfdc" in text:
         return "salesforce"
-    if "snowflake" in text or "netflix" in text:
+    if "snowflake" in text or "netflix" in text or "netflix_table" in text:
         return "snowflake"
 
     ds_keywords = {

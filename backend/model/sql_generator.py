@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from backend.config import settings
 from backend.model.llm_clients import call_llm_for_sql
 
@@ -51,13 +53,34 @@ def _quote_reserved_projection_identifiers(sql: str) -> str:
     return f"SELECT {', '.join(rewritten)}{tail}"
 
 
-def _sanitize_llm_sql(sql_text: str) -> str:
+def _fix_netflix_table_references(sql: str, expected_table: str = "") -> str:
+    """Map common LLM mistakes to the actual Snowflake table name."""
+    fixed = sql
+    table_clause = r"(FROM|JOIN|INTO|UPDATE|DELETE\s+FROM)"
+    for wrong_name in ("MOVIES", "movies", "MOVIE", "movie", "NETFLIX", "netflix"):
+        fixed = re.sub(
+            rf"\b{table_clause}\s+{wrong_name}\b",
+            r"\1 NETFLIX_TABLE",
+            fixed,
+            flags=re.IGNORECASE,
+        )
+    fixed = re.sub(
+        r"\b(FROM|JOIN)\s+netflix_table\b",
+        r"\1 NETFLIX_TABLE",
+        fixed,
+        flags=re.IGNORECASE,
+    )
+    return fixed
+
+
+def _sanitize_llm_sql(sql_text: str, expected_table: str = "") -> str:
     sql = sql_text.strip().strip("`")
     sql = sql.replace("```sql", "").replace("```", "").strip()
     lower_sql = sql.lower()
     if lower_sql.startswith("sql"):
         sql = sql[3:].strip()
     sql = _quote_reserved_projection_identifiers(sql)
+    sql = _fix_netflix_table_references(sql, expected_table)
     if ";" in sql:
         sql = sql.split(";")[0] + ";"
     elif sql:
@@ -257,8 +280,9 @@ def _build_summary_sql(expected_table: str) -> str:
 
 def generate_sql(prompt: str, intent: str, params: dict) -> tuple[str, str]:
     raw_sql = params.get("raw_sql")
+    expected_table_early = str(params.get("expected_table", "")).strip()
     if raw_sql:
-        return _sanitize_llm_sql(str(raw_sql)), "DirectSQL"
+        return _sanitize_llm_sql(str(raw_sql), expected_table_early), "DirectSQL"
 
     # Dynamic-by-default path: let the configured LLM derive SQL from natural-language intent.
     action = str(params.get("action_hint", "auto")).lower()
@@ -283,7 +307,7 @@ def generate_sql(prompt: str, intent: str, params: dict) -> tuple[str, str]:
             expected_table=expected_table,
             insert_columns_hint=insert_columns_hint,
         )
-        sanitized = _sanitize_llm_sql(llm_sql)
+        sanitized = _sanitize_llm_sql(llm_sql, expected_table)
         last_sql = sanitized
         if (
             _matches_action(sanitized, action)

@@ -74,6 +74,19 @@ async function readResponseText(response: Response): Promise<string> {
   return response.text();
 }
 
+function isExecuteApiResponse(value: unknown): value is ExecuteApiResponse {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const candidate = value as ExecuteApiResponse;
+  return (
+    Boolean(candidate.intent?.platform) &&
+    Array.isArray(candidate.result?.columns) &&
+    Array.isArray(candidate.result?.rows) &&
+    typeof candidate.sql === "string"
+  );
+}
+
 async function parseJsonResponse<T>(response: Response): Promise<T> {
   const text = await readResponseText(response);
   if (!text) {
@@ -88,8 +101,39 @@ async function parseJsonResponse<T>(response: Response): Promise<T> {
   }
 }
 
-async function readApiError(response: Response): Promise<string> {
-  const errorText = await readResponseText(response);
+async function parseExecuteResponse(response: Response): Promise<ExecuteApiResponse> {
+  const text = await readResponseText(response);
+  if (!text) {
+    throw new Error(`Empty response (${response.status})`);
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    if (!response.ok) {
+      throw new Error(
+        text.length > 400 ? `${text.slice(0, 400)}…` : text,
+      );
+    }
+    throw new Error("Invalid JSON response from backend.");
+  }
+
+  if (isExecuteApiResponse(parsed)) {
+    return parsed;
+  }
+
+  if (!response.ok) {
+    throw new Error(await readApiErrorFromText(response, text));
+  }
+
+  throw new Error("Unexpected response format from backend.");
+}
+
+async function readApiErrorFromText(
+  response: Response,
+  errorText: string,
+): Promise<string> {
   if (!errorText) {
     return `Request failed (${response.status})`;
   }
@@ -115,6 +159,10 @@ async function readApiError(response: Response): Promise<string> {
   } catch {
     return errorText;
   }
+}
+
+async function readApiError(response: Response): Promise<string> {
+  return readApiErrorFromText(response, await readResponseText(response));
 }
 
 type OAuthConfig = {
@@ -442,11 +490,7 @@ export default function Home() {
         body: JSON.stringify({ prompt }),
       });
 
-      if (!response.ok) {
-        throw new Error(await readApiError(response));
-      }
-
-      const payload = await parseJsonResponse<ExecuteApiResponse>(response);
+      const payload = await parseExecuteResponse(response);
       const platformId = payload.intent.platform.toLowerCase() as PlatformId;
       const knownPlatform = platforms.some((p) => p.id === platformId)
         ? platformId

@@ -57,7 +57,10 @@ class Settings:
 
     table_hints: str = os.getenv(
         "SNOWFLAKE_TABLE_HINTS",
-        "customers(customer_name, revenue, region); orders(order_id, customer_name, order_date, sales_amount)",
+        "NETFLIX_TABLE(show_id, type, title, director, cast, country, date_added, "
+        "release_year, rating, duration, listed_in, description); "
+        "customers(customer_name, revenue, region); "
+        "orders(order_id, customer_name, order_date, sales_amount)",
     )
 
     # ── Salesforce Hosted MCP Server ──

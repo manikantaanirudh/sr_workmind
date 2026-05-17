@@ -40,8 +40,9 @@ async function proxy(request: NextRequest, pathSegments: string[]) {
     }
 
     const responseHeaders = new Headers(upstream.headers);
+    const bodyText = await upstream.text();
 
-    return new NextResponse(upstream.body, {
+    return new NextResponse(bodyText, {
       status: upstream.status,
       statusText: upstream.statusText,
       headers: responseHeaders,
