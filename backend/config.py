@@ -145,3 +145,44 @@ class Settings:
 
 
 settings = Settings()
+
+_SF_MCP_PROD_SOBJECT_ALL = (
+    "https://api.salesforce.com/platform/mcp/v1/platform/sobject-all"
+)
+_SF_MCP_SANDBOX_SOBJECT_ALL = (
+    "https://api.salesforce.com/platform/mcp/v1/sandbox/platform/sobject-all"
+)
+
+
+def _is_sandbox_salesforce_instance(instance_url: str) -> bool:
+    """Detect scratch/sandbox orgs (must use /sandbox/ MCP base URL per Salesforce docs)."""
+    inst = instance_url.lower()
+    return any(
+        marker in inst
+        for marker in (
+            ".develop.my.salesforce.com",
+            ".sandbox.my.salesforce.com",
+            ".scratch.my.salesforce.com",
+            "--sandbox",
+            "test.salesforce.com",
+        )
+    )
+
+
+def resolve_salesforce_mcp_server_url(instance_url: str = "") -> str:
+    """Resolve hosted MCP URL for the connected org (production vs sandbox path)."""
+    configured = settings.salesforce_mcp_server_url.strip()
+    override = os.getenv("SALESFORCE_MCP_USE_SANDBOX", "").strip().lower()
+    inst = (instance_url or settings.salesforce_instance_url).strip().rstrip("/")
+
+    if override in {"1", "true", "yes", "on"}:
+        return configured if "/sandbox/" in configured else _SF_MCP_SANDBOX_SOBJECT_ALL
+    if override in {"0", "false", "no", "off"}:
+        return configured if configured else _SF_MCP_PROD_SOBJECT_ALL
+
+    if inst and _is_sandbox_salesforce_instance(inst):
+        if "/sandbox/" in configured:
+            return configured
+        return _SF_MCP_SANDBOX_SOBJECT_ALL
+
+    return configured if configured else _SF_MCP_PROD_SOBJECT_ALL

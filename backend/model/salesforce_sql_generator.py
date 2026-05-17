@@ -8,6 +8,7 @@ Mirrors the Snowflake sql_generator.py but generates SOQL
 from __future__ import annotations
 
 from backend.config import settings
+from backend.mcp.salesforce_mcp_client import ensure_mcp_soql
 from backend.mcp.schema_discovery import get_salesforce_schema_hint
 from backend.model.llm_clients import call_llm_for_soql
 
@@ -79,7 +80,8 @@ def generate_soql(prompt: str, intent: str, params: dict) -> tuple[str, str]:
         last_soql = sanitized
 
         if _is_valid_soql(sanitized):
-            return _ensure_soql_limit(sanitized), f"LLM:{settings.llm_provider}"
+            limited = _ensure_soql_limit(sanitized)
+            return ensure_mcp_soql(limited), f"LLM:{settings.llm_provider}"
 
         # Retry with stricter prompt
         llm_prompt = (
