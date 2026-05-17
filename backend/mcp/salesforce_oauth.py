@@ -84,6 +84,25 @@ def _save_tokens(tokens: dict[str, Any]) -> None:
     _TOKEN_FILE.write_text(json.dumps(tokens, indent=2), encoding="utf-8")
 
 
+def _clear_tokens() -> None:
+    """Remove stored OAuth tokens (e.g. after invalid_grant)."""
+    global _pkce_state
+    if _TOKEN_FILE.exists():
+        try:
+            _TOKEN_FILE.unlink()
+        except OSError:
+            pass
+    _pkce_state = {}
+
+
+def _access_token_expired(tokens: dict[str, Any]) -> bool:
+    obtained_at = float(tokens.get("obtained_at", 0) or 0)
+    expires_in = int(tokens.get("expires_in", 7200) or 7200)
+    if not obtained_at:
+        return False
+    return time.time() > obtained_at + expires_in - 60
+
+
 # ---------------------------------------------------------------------------
 # PKCE helpers
 # ---------------------------------------------------------------------------
@@ -179,7 +198,7 @@ def exchange_code_for_tokens(code: str, state: str) -> dict[str, Any]:
         "code_verifier": code_verifier,
     }
 
-    with httpx.Client(timeout=30.0, verify=False) as client:
+    with httpx.Client(timeout=httpx.Timeout(30.0), verify=False) as client:
         response = client.post(token_url, data=payload)
 
     print(f"[SF OAUTH] Token exchange status: {response.status_code}")
@@ -227,23 +246,33 @@ def _refresh_access_token(refresh_token: str) -> dict[str, Any]:
         "refresh_token": refresh_token,
     }
 
-    with httpx.Client(timeout=30.0, verify=False) as client:
+    with httpx.Client(timeout=httpx.Timeout(30.0), verify=False) as client:
         response = client.post(token_url, data=payload)
 
     if response.status_code != 200:
+        body = response.text
+        if response.status_code == 400 and "invalid_grant" in body:
+            _clear_tokens()
+            raise RuntimeError(
+                "Salesforce session expired (invalid_grant). "
+                "Please re-authenticate at /auth/salesforce"
+            )
         raise RuntimeError(
-            f"Salesforce token refresh failed ({response.status_code}): {response.text}. "
+            f"Salesforce token refresh failed ({response.status_code}): {body}. "
             "Please re-authenticate at /auth/salesforce"
         )
 
     token_data = response.json()
 
-    # Update stored tokens
+    # Update stored tokens (keep existing refresh_token if not rotated)
     tokens = _load_tokens()
     tokens["access_token"] = token_data.get("access_token", "")
+    if token_data.get("refresh_token"):
+        tokens["refresh_token"] = token_data["refresh_token"]
     tokens["instance_url"] = token_data.get("instance_url", instance_url)
     tokens["issued_at"] = token_data.get("issued_at", str(int(time.time() * 1000)))
     tokens["obtained_at"] = time.time()
+    tokens["expires_in"] = int(token_data.get("expires_in", tokens.get("expires_in", 7200)))
 
     _save_tokens(tokens)
     logger.info("Salesforce access token refreshed successfully.")
@@ -292,6 +321,27 @@ def get_instance_url() -> str:
 
 
 def is_authenticated() -> bool:
-    """Check if we have valid Salesforce tokens stored."""
+    """True when we have a usable session (valid access token or refreshable)."""
     tokens = _load_tokens()
-    return bool(tokens.get("access_token"))
+    if not tokens.get("access_token"):
+        return False
+    if not _access_token_expired(tokens):
+        return True
+    return bool(tokens.get("refresh_token"))
+
+
+def auth_status() -> dict[str, Any]:
+    """Status for /auth/salesforce/status — avoids false 'connected' when refresh is dead."""
+    tokens = _load_tokens()
+    if not tokens.get("access_token"):
+        return {"authenticated": False, "reason": "not_connected"}
+    expired = _access_token_expired(tokens)
+    if not expired:
+        return {"authenticated": True, "access_token_expired": False}
+    if tokens.get("refresh_token"):
+        return {
+            "authenticated": True,
+            "access_token_expired": True,
+            "reason": "access_token_expired_will_refresh",
+        }
+    return {"authenticated": False, "reason": "access_token_expired_no_refresh"}

@@ -162,7 +162,9 @@ def salesforce_oauth_callback(code: str, state: str):
 @app.get("/auth/salesforce/status")
 def salesforce_auth_status():
     """Check if Salesforce is currently authenticated."""
-    return {"authenticated": sf_is_authenticated()}
+    from backend.mcp.salesforce_oauth import auth_status
+
+    return auth_status()
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +281,14 @@ def execute(request: ExecuteRequest) -> ExecuteResponse:
         raise
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        msg = str(exc)
+        if any(
+            phrase in msg.lower()
+            for phrase in ("salesforce", "invalid_grant", "re-authenticate", "not authenticated")
+        ):
+            raise HTTPException(status_code=401, detail=msg) from exc
+        raise HTTPException(status_code=500, detail=msg) from exc
     except Exception as exc:
         detail = str(exc)
         if "Too Many Requests" in detail or "429" in detail:
@@ -357,16 +367,17 @@ def _execute_snowflake(prompt: str, intent_payload: dict, started: float) -> Exe
 
 def _execute_salesforce(prompt: str, intent_payload: dict, started: float) -> ExecuteResponse:
     """Execute a Salesforce operation through the Salesforce Hosted MCP Server."""
-    if not sf_is_authenticated():
-        base = settings.public_backend_url.strip() or settings.oauth_redirect_base_url.strip()
-        auth_path = f"{base}/auth/salesforce" if base else "/auth/salesforce"
+    base = settings.public_backend_url.strip() or settings.oauth_redirect_base_url.strip()
+    auth_path = f"{base}/auth/salesforce" if base else "/auth/salesforce"
+    try:
+        from backend.mcp.salesforce_oauth import get_valid_access_token
+
+        get_valid_access_token()
+    except RuntimeError as exc:
         raise HTTPException(
             status_code=401,
-            detail=(
-                f"Salesforce not authenticated. Open {auth_path} to connect "
-                "(required on Render after each redeploy — tokens are stored in /tmp)."
-            ),
-        )
+            detail=f"{exc} Connect at {auth_path}",
+        ) from exc
 
     action = intent_payload.get("action", "query")
     params = intent_payload.get("parameters", {})
