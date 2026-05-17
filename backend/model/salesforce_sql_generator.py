@@ -27,6 +27,15 @@ def _sanitize_soql(soql_text: str) -> str:
     return soql.strip()
 
 
+def _ensure_soql_limit(soql: str, limit: int | None = None) -> str:
+    """Append LIMIT when missing so hosted MCP soqlQuery returns faster on Render."""
+    max_rows = limit if limit is not None else settings.salesforce_soql_row_limit
+    upper = f" {soql.strip().upper()} "
+    if " LIMIT " in upper:
+        return soql.strip()
+    return f"{soql.strip()} LIMIT {max_rows}"
+
+
 def _is_valid_soql(soql: str) -> bool:
     """Basic validation: SOQL must start with SELECT or FIND."""
     upper = " ".join(soql.strip().upper().split())
@@ -70,7 +79,7 @@ def generate_soql(prompt: str, intent: str, params: dict) -> tuple[str, str]:
         last_soql = sanitized
 
         if _is_valid_soql(sanitized):
-            return sanitized, f"LLM:{settings.llm_provider}"
+            return _ensure_soql_limit(sanitized), f"LLM:{settings.llm_provider}"
 
         # Retry with stricter prompt
         llm_prompt = (

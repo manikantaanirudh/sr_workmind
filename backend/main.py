@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
+
+logger = logging.getLogger(__name__)
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -368,8 +371,14 @@ def _execute_salesforce(prompt: str, intent_payload: dict, started: float) -> Ex
     action = intent_payload.get("action", "query")
     params = intent_payload.get("parameters", {})
 
-    # --- Step 2: Validate Salesforce MCP (OAuth) ---
+    # --- Step 2: Validate Salesforce MCP (OAuth) + warm MCP session ---
     mcp_status = sf_validate_via_mcp()
+    try:
+        from backend.mcp.salesforce_mcp_client import warm_sf_mcp_session
+
+        warm_sf_mcp_session()
+    except Exception as exc:
+        logger.warning("Salesforce MCP session warm-up skipped: %s", exc)
 
     # --- Step 3: Generate SOQL or operation descriptor via LLM ---
     soql_or_op, selected_model = generate_soql(

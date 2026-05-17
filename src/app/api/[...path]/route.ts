@@ -30,7 +30,7 @@ async function proxy(request: NextRequest, pathSegments: string[]) {
   }
 
   const controller = new AbortController();
-  const timeoutMs = 180_000;
+  const timeoutMs = 300_000;
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
   const fetchUpstream = () =>

@@ -485,7 +485,11 @@ export default function Home() {
     const currentSteps = stepsFor(platformForPrompt);
     setThinkingSteps(currentSteps);
     try {
-      const response = await fetch(`${apiBase}/execute`, {
+      // Call backend directly when public URL is set (avoids Next proxy timeout on Render).
+      const executeUrl = backendPublicUrl
+        ? `${backendPublicUrl}/execute`
+        : `${apiBase}/execute`;
+      const response = await fetch(executeUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ prompt }),

@@ -34,6 +34,37 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _sf_session_id: str | None = None
+_sf_http_client: httpx.Client | None = None
+
+
+def _sf_timeout() -> httpx.Timeout:
+    return httpx.Timeout(
+        connect=20.0,
+        read=float(settings.salesforce_mcp_timeout_sec),
+        write=30.0,
+        pool=20.0,
+    )
+
+
+def _get_sf_http_client() -> httpx.Client:
+    """Reuse one HTTP client per worker (connection pooling for Render)."""
+    global _sf_http_client
+    if _sf_http_client is None:
+        _sf_http_client = httpx.Client(
+            timeout=_sf_timeout(),
+            follow_redirects=True,
+            verify=False,
+        )
+    return _sf_http_client
+
+
+def warm_sf_mcp_session() -> None:
+    """Pre-open MCP session so the first user query does not pay initialize latency."""
+    if _sf_session_id:
+        return
+    url = settings.salesforce_mcp_server_url.strip()
+    client = _get_sf_http_client()
+    _ensure_session(client, url)
 
 
 def _sf_auth_headers() -> dict[str, str]:
@@ -102,21 +133,28 @@ def _ensure_session(client: httpx.Client, url: str) -> None:
         raise RuntimeError(f"Failed to initialize Salesforce MCP session: {resp.text}")
 
 
-def _sf_send_rpc(payload: dict, retry: bool = True, timeout: float = 90.0) -> dict:
+def _sf_send_rpc(payload: dict, retry: bool = True, timeout: float | None = None) -> dict:
     """POST a JSON-RPC request to the Salesforce Hosted MCP Server."""
     url = settings.salesforce_mcp_server_url.strip()
+    client = _get_sf_http_client()
+    read_timeout = timeout if timeout is not None else float(settings.salesforce_mcp_timeout_sec)
+    request_timeout = httpx.Timeout(connect=20.0, read=read_timeout, write=30.0, pool=20.0)
 
-    with httpx.Client(timeout=timeout, follow_redirects=True, verify=False) as client:
-        # 1. Initialize session if needed
+    try:
         _ensure_session(client, url)
-        
-        # 2. Get headers (which will now include mcp-session-id)
         headers = _sf_auth_headers()
-
         logger.info("SF MCP RPC -> %s method=%s", url, payload.get("method"))
-
-        # 3. Send the actual request
-        response = client.post(url, headers=headers, json=payload)
+        response = client.post(url, headers=headers, json=payload, timeout=request_timeout)
+    except httpx.ReadTimeout as exc:
+        raise RuntimeError(
+            f"Salesforce MCP request timed out after {read_timeout:.0f}s. "
+            "Retry once, or reconnect at /auth/salesforce if the session expired."
+        ) from exc
+    except httpx.TimeoutException as exc:
+        raise RuntimeError(
+            f"Salesforce MCP connection timed out: {exc}. "
+            "Check Render network access to api.salesforce.com."
+        ) from exc
 
     logger.debug("SF MCP response status=%s", response.status_code)
 
@@ -214,40 +252,20 @@ def sf_mcp_tools_list(force_refresh: bool = False) -> list[dict]:
                 "Salesforce tools/list empty; using documented sobject-all tool names."
             )
             tools = list(_DEFAULT_SF_TOOLS)
-    except RuntimeError as exc:
-        if "empty" in str(exc).lower() or "invalid" in str(exc).lower():
-            logger.warning("Salesforce tools/list unavailable (%s); using defaults.", exc)
-            tools = list(_DEFAULT_SF_TOOLS)
-        else:
-            raise
+    except (RuntimeError, httpx.TimeoutException) as exc:
+        logger.warning("Salesforce tools/list unavailable (%s); using defaults.", exc)
+        tools = list(_DEFAULT_SF_TOOLS)
 
     _sf_tools_cache = tools
     return tools
 
 
 def _build_sf_tool_arguments(tool_name: str, value_map: dict[str, Any]) -> dict[str, Any]:
-    """Map logical argument names to the tool's declared inputSchema property names."""
-    for tool in sf_mcp_tools_list():
-        if tool.get("name") != tool_name:
-            continue
-        schema = tool.get("inputSchema") or tool.get("input_schema") or {}
-        properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
-        if not properties:
-            break
-        arguments: dict[str, Any] = {}
-        for prop in properties:
-            if prop in value_map:
-                arguments[prop] = value_map[prop]
-                continue
-            prop_lower = prop.lower().replace("-", "").replace("_", "")
-            for key, val in value_map.items():
-                key_norm = key.lower().replace("-", "").replace("_", "")
-                if prop_lower == key_norm:
-                    arguments[prop] = val
-                    break
-        if arguments:
-            return arguments
-
+    """Build tools/call arguments without blocking on tools/list."""
+    if tool_name == "soqlQuery" and "query" in value_map:
+        return {"query": value_map["query"]}
+    if tool_name == "find" and value_map.get("search"):
+        return {"search": value_map["search"]}
     return {k: v for k, v in value_map.items() if v is not None}
 
 
@@ -296,17 +314,8 @@ def execute_soql_via_mcp(soql: str) -> tuple[list[str], list[list[Any]]]:
 
 
 def execute_sf_search(search_query: str) -> tuple[list[str], list[list[Any]]]:
-    """Execute a SOSL search through the Salesforce MCP Server.
-
-    Args:
-        search_query: The SOSL search expression.
-
-    Returns:
-        A tuple of (columns, rows).
-    """
-    from backend.mcp.tool_registry import resolve_salesforce_tool
-
-    tool_name = resolve_salesforce_tool("find", "search")
+    """Execute a SOSL search through the Salesforce MCP Server."""
+    tool_name = "find"
     arguments = _build_sf_tool_arguments(
         tool_name,
         {

@@ -88,6 +88,8 @@ class Settings:
     )
     # Optional override; when empty, schema is discovered via Salesforce MCP getObjectSchema.
     salesforce_object_hints: str = os.getenv("SALESFORCE_OBJECT_HINTS", "")
+    salesforce_mcp_timeout_sec: int = int(os.getenv("SALESFORCE_MCP_TIMEOUT_SEC", "120"))
+    salesforce_soql_row_limit: int = int(os.getenv("SALESFORCE_SOQL_ROW_LIMIT", "100"))
 
     # Docusign Fully Managed MCP Server (Beta)
     docusign_client_id: str = os.getenv("DOCUSIGN_CLIENT_ID", "")
