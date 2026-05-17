@@ -17,6 +17,16 @@ def _clean_env(value: str) -> str:
     return cleaned
 
 
+def _normalize_snowflake_pat(pat: str) -> str:
+    """Normalize PAT; fix accidental double-paste (Render often yields length 452 = 2x226)."""
+    pat = _clean_env(pat)
+    if len(pat) % 2 == 0:
+        half = len(pat) // 2
+        if pat[:half] == pat[half:]:
+            return pat[:half]
+    return pat
+
+
 @dataclass
 class Settings:
     app_env: str = os.getenv("APP_ENV", "dev")
@@ -104,7 +114,7 @@ class Settings:
     )
 
     def __post_init__(self) -> None:
-        self.snowflake_pat = _clean_env(self.snowflake_pat)
+        self.snowflake_pat = _normalize_snowflake_pat(self.snowflake_pat)
         self.snowflake_account = _clean_env(self.snowflake_account)
         self.snowflake_database = _clean_env(self.snowflake_database)
         self.snowflake_schema = _clean_env(self.snowflake_schema)

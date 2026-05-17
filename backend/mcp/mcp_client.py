@@ -422,9 +422,16 @@ def _execute_sql_via_mcp_tools(sql: str, clean_sql: str) -> tuple[list[str], lis
 def probe_snowflake_connectivity() -> dict[str, Any]:
     """Non-secret connectivity probe for /health/diagnostics."""
     pat = settings.snowflake_pat
+    pat_ok_length = 200 <= len(pat) <= 280
     info: dict[str, Any] = {
         "pat_configured": bool(pat),
         "pat_length": len(pat),
+        "pat_length_ok": pat_ok_length,
+        "pat_hint": (
+            None
+            if pat_ok_length
+            else "PAT should be ~226 chars; 452 usually means the token was pasted twice in Render."
+        ),
         "account": settings.snowflake_account,
         "database": settings.snowflake_database,
         "schema": settings.snowflake_schema,
