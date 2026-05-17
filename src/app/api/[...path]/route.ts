@@ -54,8 +54,13 @@ async function proxy(request: NextRequest, pathSegments: string[]) {
       }
     }
 
-    const responseHeaders = new Headers(upstream.headers);
     const bodyText = await upstream.text();
+    // Do not forward content-encoding/content-length from upstream: body is already decoded.
+    const responseHeaders = new Headers();
+    const contentType = upstream.headers.get("content-type");
+    if (contentType) {
+      responseHeaders.set("content-type", contentType);
+    }
 
     return new NextResponse(bodyText, {
       status: upstream.status,

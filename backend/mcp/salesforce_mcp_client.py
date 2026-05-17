@@ -102,7 +102,7 @@ def _ensure_session(client: httpx.Client, url: str) -> None:
         raise RuntimeError(f"Failed to initialize Salesforce MCP session: {resp.text}")
 
 
-def _sf_send_rpc(payload: dict, retry: bool = True, timeout: float = 120.0) -> dict:
+def _sf_send_rpc(payload: dict, retry: bool = True, timeout: float = 90.0) -> dict:
     """POST a JSON-RPC request to the Salesforce Hosted MCP Server."""
     url = settings.salesforce_mcp_server_url.strip()
 
@@ -201,7 +201,7 @@ def sf_mcp_tools_list(force_refresh: bool = False) -> list[dict]:
 
     try:
         payload = _sf_jsonrpc_request("tools/list")
-        response = _sf_send_rpc(payload)
+        response = _sf_send_rpc(payload, timeout=20.0)
         tools: list[dict] = []
         if isinstance(response, dict):
             if "tools" in response:
@@ -286,14 +286,10 @@ def sf_mcp_tools_call(tool_name: str, arguments: dict[str, Any]) -> dict:
 
 def execute_soql_via_mcp(soql: str) -> tuple[list[str], list[list[Any]]]:
     """Execute SOQL via Salesforce hosted MCP server (soqlQuery tool)."""
-    from backend.mcp.tool_registry import resolve_salesforce_tool
-
     clean_soql = soql.strip().rstrip(";")
-    tool_name = resolve_salesforce_tool("soqlQuery", "soql_query")
-    arguments = _build_sf_tool_arguments(
-        tool_name,
-        {"query": clean_soql, "soql": clean_soql, "q": clean_soql},
-    )
+    # platform/sobject-all always exposes soqlQuery — skip slow tools/list on Render.
+    tool_name = "soqlQuery"
+    arguments = {"query": clean_soql}
     logger.info("Salesforce MCP tools/call -> %s", tool_name)
     result = sf_mcp_tools_call(tool_name, arguments)
     return _parse_sf_tool_result(result)

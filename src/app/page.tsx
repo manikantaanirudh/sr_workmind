@@ -111,12 +111,13 @@ async function parseExecuteResponse(response: Response): Promise<ExecuteApiRespo
   try {
     parsed = JSON.parse(text);
   } catch {
+    const preview = text.length > 300 ? `${text.slice(0, 300)}…` : text;
     if (!response.ok) {
-      throw new Error(
-        text.length > 400 ? `${text.slice(0, 400)}…` : text,
-      );
+      throw new Error(preview);
     }
-    throw new Error("Invalid JSON response from backend.");
+    throw new Error(
+      `Invalid JSON from backend (HTTP ${response.status}). Preview: ${preview}`,
+    );
   }
 
   if (isExecuteApiResponse(parsed)) {
@@ -579,6 +580,24 @@ export default function Home() {
       }
       if (msg.toLowerCase().includes("salesforce not authenticated")) {
         setActivePlatform("salesforce");
+        const sfAuth =
+          oauthCallbacks?.salesforce_callback_url?.replace(
+            "/oauth/salesforce/callback",
+            "/auth/salesforce",
+          ) ||
+          (backendPublicUrl
+            ? `${backendPublicUrl}/auth/salesforce`
+            : `${apiBase}/auth/salesforce`);
+        setMessages((prev) => [
+          ...prev.slice(0, -1),
+          {
+            role: "assistant",
+            content: `Salesforce is not connected on this server. Open ${sfAuth} to authorize, then retry your prompt.`,
+            outputType: "text",
+          },
+        ]);
+        setIsThinking(false);
+        return;
       }
       setThinkingSteps((prev) =>
         prev.map((step, index) =>

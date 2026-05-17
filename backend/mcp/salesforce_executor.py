@@ -77,7 +77,8 @@ def sf_route_and_execute(
     """
     if not is_authenticated():
         raise RuntimeError(
-            "Salesforce not authenticated. Please visit /auth/salesforce to connect."
+            "Salesforce not authenticated. Open https://sr-workmind-backend.onrender.com/auth/salesforce "
+            "(Render tokens reset on redeploy)."
         )
 
     sf_params = sf_params or {}

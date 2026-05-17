@@ -354,10 +354,21 @@ def _execute_snowflake(prompt: str, intent_payload: dict, started: float) -> Exe
 
 def _execute_salesforce(prompt: str, intent_payload: dict, started: float) -> ExecuteResponse:
     """Execute a Salesforce operation through the Salesforce Hosted MCP Server."""
+    if not sf_is_authenticated():
+        base = settings.public_backend_url.strip() or settings.oauth_redirect_base_url.strip()
+        auth_path = f"{base}/auth/salesforce" if base else "/auth/salesforce"
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                f"Salesforce not authenticated. Open {auth_path} to connect "
+                "(required on Render after each redeploy — tokens are stored in /tmp)."
+            ),
+        )
+
     action = intent_payload.get("action", "query")
     params = intent_payload.get("parameters", {})
 
-    # --- Step 2: Validate Salesforce MCP (cached tools/list + OAuth) ---
+    # --- Step 2: Validate Salesforce MCP (OAuth) ---
     mcp_status = sf_validate_via_mcp()
 
     # --- Step 3: Generate SOQL or operation descriptor via LLM ---

@@ -265,7 +265,8 @@ def get_valid_access_token() -> str:
 
     if not tokens.get("access_token"):
         raise RuntimeError(
-            "Salesforce not authenticated. Please visit /auth/salesforce to connect your Salesforce org."
+            "Salesforce not authenticated. Please visit /auth/salesforce to connect your Salesforce org. "
+            "On Render, use https://sr-workmind-backend.onrender.com/auth/salesforce after each deploy."
         )
 
     # Check if token is expired (Salesforce tokens typically last 2 hours)
