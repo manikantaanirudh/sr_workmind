@@ -1,0 +1,5 @@
+backend/.venv
+backend/logs
+.next
+node_modules
+*.log

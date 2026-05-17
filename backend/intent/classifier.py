@@ -1,0 +1,377 @@
+from typing import Any
+
+
+def _extract_raw_sql(prompt: str) -> str | None:
+    stripped = prompt.strip()
+    if not stripped:
+        return None
+    lowered = " ".join(stripped.lower().split())
+
+    # Accept only SQL-shaped statements, not English instructions.
+    if lowered.startswith("select ") or lowered.startswith("with "):
+        return stripped
+    if lowered.startswith("insert into ") and (" values " in lowered or " select " in lowered):
+        return stripped
+    if lowered.startswith("update ") and " set " in lowered and " where " in lowered:
+        return stripped
+    if lowered.startswith("delete from ") and " where " in lowered:
+        return stripped
+    if lowered.startswith("create table ") or lowered.startswith("create or replace table "):
+        return stripped
+
+    return None
+
+
+def _infer_action_hint(prompt: str) -> str:
+    text = prompt.lower()
+    if any(word in text for word in ["create", "make", "build"]):
+        return "create"
+    if any(word in text for word in ["insert", "add", "append"]):
+        return "insert"
+    if any(word in text for word in ["delete", "remove"]):
+        return "delete"
+    if any(word in text for word in ["update", "modify", "change"]):
+        return "update"
+    if any(word in text for word in ["select", "show", "list", "get", "find", "retrieve", "summarize", "summary", "profile"]):
+        return "query"
+    return "auto"
+
+
+def _is_summary_prompt(prompt: str) -> bool:
+    text = prompt.lower()
+    return any(word in text for word in ["summarize", "summary", "profile"])
+
+
+def _normalize_prompt_text(prompt: str) -> str:
+    chars: list[str] = []
+    for ch in prompt:
+        if ch.isalnum() or ch in {"_", "$", "."}:
+            chars.append(ch)
+        else:
+            chars.append(" ")
+    return " ".join("".join(chars).split())
+
+
+def _is_identifier_token(token: str) -> bool:
+    if not token:
+        return False
+    if not (token[0].isalpha() or token[0] == "_"):
+        return False
+    return all(ch.isalnum() or ch in {"_", "$", "."} for ch in token)
+
+
+def _clean_identifier(token: str) -> str:
+    return token.strip().strip("'\"").strip()
+
+
+def _find_identifier_after(tokens: list[str], anchor: str, skip_words: set[str], max_lookahead: int = 7) -> str | None:
+    for i, token in enumerate(tokens):
+        if token != anchor:
+            continue
+        steps = 0
+        j = i + 1
+        while j < len(tokens) and steps < max_lookahead:
+            candidate = _clean_identifier(tokens[j])
+            low = candidate.lower()
+            if low in skip_words:
+                j += 1
+                steps += 1
+                continue
+            if _is_identifier_token(candidate):
+                return candidate
+            j += 1
+            steps += 1
+    return None
+
+
+def _extract_table_hint(prompt: str, action_hint: str) -> str | None:
+    normalized = _normalize_prompt_text(prompt).lower()
+    tokens = normalized.split()
+    if not tokens:
+        return None
+
+    skip_words = {
+        "the",
+        "a",
+        "an",
+        "table",
+        "values",
+        "rows",
+        "row",
+        "record",
+        "records",
+        "data",
+        "these",
+        "this",
+        "all",
+        "new",
+        "existing",
+    }
+
+    # Common explicit anchor: "... <name> table ..."
+    for i, token in enumerate(tokens):
+        if token == "table" and i > 0:
+            prev = _clean_identifier(tokens[i - 1])
+            if _is_identifier_token(prev) and prev not in skip_words:
+                return prev
+
+    anchors_by_action: dict[str, list[str]] = {
+        "insert": ["into", "in", "table"],
+        "delete": ["from", "table"],
+        "update": ["update", "in", "table"],
+        "create": ["named", "table"],
+        "query": ["from", "summarize", "summary", "profile", "table"],
+    }
+
+    for anchor in anchors_by_action.get(action_hint, ["table", "into", "from"]):
+        candidate = _find_identifier_after(tokens, anchor, skip_words)
+        if candidate:
+            return candidate
+
+    return None
+
+
+def _extract_insert_columns_hint(prompt: str) -> list[str]:
+    # Supports prompts like:
+    # - "Title: Hero, Director: Venky"
+    # - "SHOW_ID='s1001', TITLE='The Lost City'"
+    # without regex parsing.
+    columns: list[str] = []
+    stop_words = {
+        "with",
+        "to",
+        "set",
+        "where",
+        "values",
+        "value",
+        "and",
+        "or",
+        "into",
+        "in",
+        "table",
+    }
+
+    for chunk in prompt.split(","):
+        part = chunk.strip()
+        if not part:
+            continue
+
+        delimiter = ""
+        if "=" in part:
+            delimiter = "="
+        elif ":" in part:
+            delimiter = ":"
+        if not delimiter:
+            continue
+
+        left = part.split(delimiter, 1)[0].strip().strip("'\"")
+        if not left:
+            continue
+        parts = _normalize_prompt_text(left).split()
+        if not parts:
+            continue
+        col = parts[-1].lower()
+        if _is_identifier_token(col) and col not in stop_words and col not in columns:
+            columns.append(col)
+    return columns
+
+
+def _detect_platform(prompt: str) -> str:
+    """Detect whether the prompt targets Snowflake, Salesforce, or Docusign.
+
+    Uses keyword matching to determine the target platform.
+    Explicit platform mentions take priority.
+    """
+    text = prompt.lower()
+    words = set(text.split())
+
+    # Explicit platform mentions take highest priority
+    if "docusign" in text or "docu sign" in text:
+        return "docusign"
+    if "salesforce" in text or "sfdc" in text:
+        return "salesforce"
+    if "snowflake" in text or "netflix" in text:
+        return "snowflake"
+
+    ds_keywords = {
+        "agreement", "agreements", "contract", "contracts",
+        "envelope", "envelopes", "signature", "signatures",
+        "signing", "navigator", "maestro", "workflow", "workflows",
+        "counterparty", "counterparties",
+    }
+    if words & ds_keywords:
+        return "docusign"
+
+    # Salesforce CRM object keywords
+    sf_keywords = {
+        "account", "accounts", "contact", "contacts",
+        "opportunity", "opportunities", "lead", "leads",
+        "case", "cases", "task", "tasks",
+        "crm", "pipeline", "deal", "deals",
+        "prospect", "prospects", "sobject",
+    }
+
+    # Check if any Salesforce keywords appear in the prompt
+    if words & sf_keywords:
+        return "salesforce"
+
+    # Default to Snowflake
+    return "snowflake"
+
+
+def _infer_sf_action(prompt: str) -> str:
+    """Infer the Salesforce-specific action from the prompt."""
+    text = prompt.lower()
+    if any(word in text for word in ["create", "add", "insert", "new"]):
+        return "create"
+    if any(word in text for word in ["update", "modify", "change", "edit"]):
+        return "update"
+    if any(word in text for word in ["delete", "remove"]):
+        return "delete"
+    if any(word in text for word in ["search", "find", "look up", "lookup"]):
+        return "search"
+    if any(word in text for word in ["describe", "schema", "fields", "structure"]):
+        return "schema"
+    return "query"
+
+
+def _extract_sf_object(prompt: str) -> str:
+    """Extract the Salesforce object type from the prompt."""
+    text = prompt.lower()
+    sf_objects = {
+        "account": "Account",
+        "accounts": "Account",
+        "contact": "Contact",
+        "contacts": "Contact",
+        "opportunity": "Opportunity",
+        "opportunities": "Opportunity",
+        "lead": "Lead",
+        "leads": "Lead",
+        "case": "Case",
+        "cases": "Case",
+        "task": "Task",
+        "tasks": "Task",
+    }
+    for keyword, obj_name in sf_objects.items():
+        if keyword in text:
+            return obj_name
+    return ""
+
+
+def _infer_ds_action(prompt: str) -> str:
+    """Infer a Docusign MCP action family from a natural-language prompt."""
+    text = prompt.lower()
+    if "trigger" in text and "workflow" in text:
+        return "trigger_workflow"
+    if "requirement" in text and "workflow" in text:
+        return "workflow_requirements"
+    if any(word in text for word in ["detail", "details", "metadata", "specific"]):
+        return "agreement_details"
+    return "query_agreements"
+
+
+def classify_intent(prompt: str) -> dict[str, Any]:
+    # Detect platform
+    platform = _detect_platform(prompt)
+
+    # --- Docusign path ---
+    if platform == "docusign":
+        action = _infer_ds_action(prompt)
+        intent = "ds_query_agreements"
+        if action == "agreement_details":
+            intent = "ds_agreement_details"
+        elif action == "workflow_requirements":
+            intent = "ds_workflow_requirements"
+        elif action == "trigger_workflow":
+            intent = "ds_trigger_workflow"
+
+        return {
+            "platform": "docusign",
+            "action": action,
+            "intent": intent,
+            "parameters": {"action_hint": action},
+        }
+
+    # --- Salesforce path ---
+    if platform == "salesforce":
+        action = _infer_sf_action(prompt)
+        sf_object = _extract_sf_object(prompt)
+
+        intent = "sf_query"
+        if action == "create":
+            intent = "sf_record_created"
+        elif action == "update":
+            intent = "sf_record_updated"
+        elif action == "delete":
+            intent = "sf_record_deleted"
+        elif action == "search":
+            intent = "sf_search"
+        elif action == "schema":
+            intent = "sf_schema"
+
+        params: dict[str, Any] = {"action_hint": action}
+        if sf_object:
+            params["sobject_name"] = sf_object
+
+        return {
+            "platform": "salesforce",
+            "action": action,
+            "intent": intent,
+            "parameters": params,
+        }
+
+    # --- Snowflake path (existing logic, completely unchanged) ---
+    raw_sql = _extract_raw_sql(prompt)
+    if raw_sql:
+        first_word = raw_sql.strip().split(None, 1)[0].lower()
+        action = "query"
+        intent = "ad_hoc_query"
+        if first_word == "create":
+            action = "create"
+            intent = "create_table"
+        elif first_word == "insert":
+            action = "insert"
+            intent = "insert_rows"
+        elif first_word == "update":
+            action = "update"
+            intent = "update_rows"
+        elif first_word == "delete":
+            action = "delete"
+            intent = "delete_rows"
+        return {
+            "platform": "snowflake",
+            "action": action,
+            "intent": intent,
+            "parameters": {"raw_sql": raw_sql},
+        }
+
+    action_hint = _infer_action_hint(prompt)
+    intent = "nl_request"
+    is_summary = _is_summary_prompt(prompt)
+    if action_hint == "create":
+        intent = "create_table"
+    elif action_hint == "insert":
+        intent = "insert_rows"
+    elif action_hint == "update":
+        intent = "update_rows"
+    elif action_hint == "delete":
+        intent = "delete_rows"
+    elif action_hint == "query" and is_summary:
+        intent = "summarize_table"
+
+    params_sf: dict[str, Any] = {"action_hint": action_hint}
+    table_hint = _extract_table_hint(prompt, action_hint)
+    if table_hint:
+        params_sf["expected_table"] = table_hint
+    if action_hint == "insert":
+        insert_cols = _extract_insert_columns_hint(prompt)
+        if insert_cols:
+            params_sf["insert_columns_hint"] = insert_cols
+
+    return {
+        "platform": "snowflake",
+        "action": action_hint,
+        "intent": intent,
+        "parameters": params_sf,
+    }
+

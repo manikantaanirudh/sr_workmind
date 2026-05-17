@@ -1,0 +1,144 @@
+@import "tailwindcss";
+
+:root {
+  --background: #eef3f9;
+  --foreground: #0d2345;
+  --panel: #f7f9fc;
+  --card: #ffffff;
+  --muted: #516783;
+  --line: #bfd0e3;
+  --accent: #003b79;
+  --accent-soft: #dce8f8;
+  --success: #0f766e;
+  --warning: #a16207;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-manrope);
+  --font-mono: var(--font-space-grotesk);
+}
+
+body {
+  margin: 0;
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-manrope), sans-serif;
+}
+
+.app-backdrop {
+  background:
+    radial-gradient(circle at 6% 10%, #d8e4f4 0%, transparent 36%),
+    radial-gradient(circle at 88% 12%, #dce8f8 0%, transparent 30%),
+    linear-gradient(145deg, #eef2f7 0%, #f7f9fc 42%, #edf2f8 100%);
+}
+
+.sr-shell {
+  background:
+    radial-gradient(circle at 72% 8%, rgba(90, 141, 221, 0.3), transparent 34%),
+    radial-gradient(circle at 18% 24%, rgba(47, 98, 172, 0.24), transparent 40%),
+    linear-gradient(135deg, #08172e 0%, #0a1d39 48%, #09172f 100%);
+}
+
+.sr-topline {
+  background: linear-gradient(90deg, #122746 0%, #1d3d6a 100%);
+  border-bottom: 1px solid rgba(164, 195, 241, 0.32);
+}
+
+.sr-sidebar {
+  border-right: 1px solid rgba(255, 255, 255, 0.12);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.02));
+}
+
+.sr-command {
+  border: 1px solid rgba(181, 208, 244, 0.3);
+  background:
+    radial-gradient(circle at 10% 16%, rgba(131, 182, 255, 0.28), transparent 32%),
+    radial-gradient(circle at 80% 20%, rgba(118, 155, 231, 0.24), transparent 34%),
+    linear-gradient(120deg, rgba(16, 48, 94, 0.96) 0%, rgba(12, 33, 70, 0.94) 100%);
+  box-shadow: 0 20px 44px rgba(4, 13, 29, 0.48);
+}
+
+.sr-brand-wordmark {
+  color: #f6fbff;
+  font-size: 15px;
+  font-weight: 500;
+  letter-spacing: 0.14em;
+  line-height: 1;
+}
+
+@media (min-width: 768px) {
+  .sr-brand-wordmark {
+    font-size: 28px;
+  }
+}
+
+.glass-card {
+  background: color-mix(in srgb, var(--card) 90%, #eaf0f9 10%);
+  border: 1px solid color-mix(in srgb, var(--line) 74%, white 26%);
+  box-shadow: 0 10px 24px rgba(15, 36, 65, 0.08);
+}
+
+.grid-texture {
+  background-image:
+    linear-gradient(to right, rgba(15, 23, 42, 0.05) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(15, 23, 42, 0.05) 1px, transparent 1px);
+  background-size: 26px 26px;
+}
+
+.stage-pulse {
+  animation: pulse-stage 1.3s ease-in-out infinite;
+}
+
+.flow-arrow {
+  position: relative;
+  overflow: hidden;
+}
+
+.flow-arrow::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    #38bdf8 50%,
+    transparent 100%
+  );
+  animation: flow 1.4s linear infinite;
+}
+
+.fade-in-up {
+  animation: fade-up 480ms ease-out both;
+}
+
+@keyframes pulse-stage {
+  0%,
+  100% {
+    opacity: 0.6;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@keyframes flow {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}

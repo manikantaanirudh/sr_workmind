@@ -1,0 +1,86 @@
+# Render Blueprint — deploy both services from this repo.
+# Dashboard: New → Blueprint → connect GitHub repo → Apply.
+#
+# After the first deploy, set secret env vars in the Render dashboard
+# (GROQ_API_KEY, SNOWFLAKE_*, SALESFORCE_*, DOCUSIGN_*, etc.).
+
+services:
+  - type: web
+    name: sr-workmind-backend
+    runtime: python
+    plan: free
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.8"
+      - key: APP_ENV
+        value: production
+      - key: TOKEN_STORAGE_DIR
+        value: /tmp/sr-workmind-tokens
+      - key: LLM_PROVIDER
+        value: groq
+      - key: GROQ_MODEL
+        value: llama-3.1-8b-instant
+      - key: MCP_SERVER_NAME
+        value: srworkmind_mcp_server
+      - key: MCP_TOOL_NAME
+        value: sql_exec_tool
+      - key: DOCUSIGN_OAUTH_BASE_URL
+        value: https://account-d.docusign.com
+      - key: DOCUSIGN_MCP_RESOURCE
+        value: https://mcp-d.docusign.com/mcp
+      - key: DOCUSIGN_SCOPES
+        value: signature extended agreement_object_model_read aow_manage
+      - key: DOCUSIGN_REQUIRE_HUMAN_APPROVAL
+        value: "true"
+      # Wired automatically between services (no manual copy/paste of URLs).
+      - key: PUBLIC_BACKEND_URL
+        fromService:
+          name: sr-workmind-backend
+          type: web
+          envVarKey: RENDER_EXTERNAL_URL
+      - key: FRONTEND_ORIGIN
+        fromService:
+          name: sr-workmind-frontend
+          type: web
+          envVarKey: RENDER_EXTERNAL_URL
+      # Set these in the Render dashboard (sync: false = prompt on deploy).
+      - key: GROQ_API_KEY
+        sync: false
+      - key: SNOWFLAKE_ACCOUNT
+        sync: false
+      - key: SNOWFLAKE_DATABASE
+        sync: false
+      - key: SNOWFLAKE_SCHEMA
+        sync: false
+      - key: SNOWFLAKE_PAT
+        sync: false
+      - key: SALESFORCE_INSTANCE_URL
+        sync: false
+      - key: SALESFORCE_CONSUMER_KEY
+        sync: false
+      - key: DOCUSIGN_CLIENT_ID
+        sync: false
+      - key: DOCUSIGN_CLIENT_SECRET
+        sync: false
+      - key: DOCUSIGN_MCP_SERVER_URL
+        sync: false
+
+  - type: web
+    name: sr-workmind-frontend
+    runtime: node
+    plan: free
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: NODE_VERSION
+        value: "20.18.0"
+      # Internal Render network URL (read at request time by src/app/api/[...path]/route.ts).
+      - key: BACKEND_API_BASE_URL
+        fromService:
+          name: sr-workmind-backend
+          type: web
+          property: hostport
