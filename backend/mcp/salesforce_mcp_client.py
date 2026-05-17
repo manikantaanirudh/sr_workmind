@@ -23,6 +23,7 @@ from typing import Any
 import httpx
 
 from backend.config import settings
+from backend.mcp.mcp_protocol import decode_rpc_response
 from backend.mcp.salesforce_oauth import get_valid_access_token
 
 logger = logging.getLogger(__name__)
@@ -74,7 +75,7 @@ def _ensure_session(client: httpx.Client, url: str) -> None:
     if _sf_session_id:
         return
 
-    print("[SF MCP DEBUG] Initializing new MCP session...")
+    logger.info("Initializing Salesforce MCP session")
     init_payload = {
         "jsonrpc": "2.0",
         "id": 9999,
@@ -95,9 +96,9 @@ def _ensure_session(client: httpx.Client, url: str) -> None:
     resp = client.post(url, headers=headers, json=init_payload)
     if resp.status_code == 200:
         _sf_session_id = resp.headers.get("mcp-session-id")
-        print(f"[SF MCP DEBUG] Acquired mcp-session-id: {_sf_session_id}")
+        logger.info("Salesforce MCP session id acquired")
     else:
-        print(f"[SF MCP DEBUG] Failed to initialize session: {resp.status_code} {resp.text}")
+        logger.error("Salesforce MCP initialize failed: %s %s", resp.status_code, resp.text[:300])
         raise RuntimeError(f"Failed to initialize Salesforce MCP session: {resp.text}")
 
 
@@ -112,17 +113,12 @@ def _sf_send_rpc(payload: dict, retry: bool = True, timeout: float = 120.0) -> d
         # 2. Get headers (which will now include mcp-session-id)
         headers = _sf_auth_headers()
 
-        logger.info("SF MCP RPC -> %s  method=%s", url, payload.get("method"))
-        print(f"[SF MCP DEBUG] POST {url}")
-        print(f"[SF MCP DEBUG] Headers: {headers}")
-        print(f"[SF MCP DEBUG] Method: {payload.get('method')}")
-        print(f"[SF MCP DEBUG] Payload: {json.dumps(payload)}")
+        logger.info("SF MCP RPC -> %s method=%s", url, payload.get("method"))
 
         # 3. Send the actual request
         response = client.post(url, headers=headers, json=payload)
 
-    print(f"[SF MCP DEBUG] Response status: {response.status_code}")
-    print(f"[SF MCP DEBUG] Response body: {response.text[:1000]}")
+    logger.debug("SF MCP response status=%s", response.status_code)
 
     if response.status_code == 401:
         raise RuntimeError(
@@ -139,12 +135,12 @@ def _sf_send_rpc(payload: dict, retry: bool = True, timeout: float = 120.0) -> d
     # If body is empty (like for tools/list), raise a specific JSON error
     text = response.text.strip()
     if not text:
-        raise RuntimeError("Empty JSON response from Salesforce MCP Server.")
+        return {}
 
     try:
-        data = response.json()
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Invalid JSON from Salesforce MCP Server: {exc}")
+        data = decode_rpc_response(response)
+    except RuntimeError as exc:
+        raise RuntimeError(f"Invalid response from Salesforce MCP Server: {exc}") from exc
 
     # Check for JSON-RPC level errors
     if "error" in data:
@@ -162,7 +158,7 @@ def _sf_send_rpc(payload: dict, retry: bool = True, timeout: float = 120.0) -> d
         if "Unexpected error" in error_text and retry:
             global _sf_session_id
             if _sf_session_id:
-                print("[SF MCP] Session likely expired. Clearing session and retrying...")
+                logger.info("Salesforce MCP session expired; retrying once")
                 _sf_session_id = None
                 # Generate a fresh payload with a new session id
                 if "method" in payload:
@@ -182,6 +178,17 @@ def _sf_send_rpc(payload: dict, retry: bool = True, timeout: float = 120.0) -> d
 
 _sf_tools_cache: list[dict] | None = None
 
+# Salesforce hosted MCP may return an empty tools/list body (async catalog). These are the
+# documented tools for platform/sobject-all per Salesforce Hosted MCP Server reference.
+_DEFAULT_SF_TOOLS: list[dict] = [
+    {"name": "soqlQuery"},
+    {"name": "getObjectSchema"},
+    {"name": "createSobjectRecord"},
+    {"name": "updateSobjectRecord"},
+    {"name": "deleteSobjectRecord"},
+    {"name": "find"},
+]
+
 
 def sf_mcp_tools_list(force_refresh: bool = False) -> list[dict]:
     """Retrieve tools from Salesforce hosted MCP server (tools/list).
@@ -192,20 +199,27 @@ def sf_mcp_tools_list(force_refresh: bool = False) -> list[dict]:
     if _sf_tools_cache is not None and not force_refresh:
         return _sf_tools_cache
 
-    payload = _sf_jsonrpc_request("tools/list")
-    response = _sf_send_rpc(payload)
-    tools: list[dict] = []
-    if isinstance(response, dict):
-        if "tools" in response:
-            tools = response.get("tools", [])
-        elif "result" in response and isinstance(response["result"], dict):
-            tools = response["result"].get("tools", [])
+    try:
+        payload = _sf_jsonrpc_request("tools/list")
+        response = _sf_send_rpc(payload)
+        tools: list[dict] = []
+        if isinstance(response, dict):
+            if "tools" in response:
+                tools = response.get("tools", [])
+            elif "result" in response and isinstance(response["result"], dict):
+                tools = response["result"].get("tools", [])
 
-    if not tools:
-        raise RuntimeError(
-            "Salesforce hosted MCP server returned no tools from tools/list. "
-            "Verify OAuth (mcp_api scope) and SALESFORCE_MCP_SERVER_URL."
-        )
+        if not tools:
+            logger.info(
+                "Salesforce tools/list empty; using documented sobject-all tool names."
+            )
+            tools = list(_DEFAULT_SF_TOOLS)
+    except RuntimeError as exc:
+        if "empty" in str(exc).lower() or "invalid" in str(exc).lower():
+            logger.warning("Salesforce tools/list unavailable (%s); using defaults.", exc)
+            tools = list(_DEFAULT_SF_TOOLS)
+        else:
+            raise
 
     _sf_tools_cache = tools
     return tools

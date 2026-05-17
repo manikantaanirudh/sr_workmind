@@ -17,13 +17,16 @@ class Settings:
     public_backend_url: str = os.getenv("PUBLIC_BACKEND_URL", "")
     oauth_redirect_base_url: str = os.getenv("OAUTH_REDIRECT_BASE_URL", "")
     token_storage_dir: str = os.getenv("TOKEN_STORAGE_DIR", str(backend_dir / "logs"))
-    # Optional emergency fallback only — SR WorkMind uses Snowflake hosted MCP by default.
+    # Prefer MCP tools/call; fall back to SQL API (same PAT) when sql_exec_tool fails on account.
     snowflake_use_sql_api: bool = os.getenv("SNOWFLAKE_USE_SQL_API", "false").strip().lower() in {
         "1",
         "true",
         "yes",
         "on",
     }
+    snowflake_mcp_sql_api_fallback: bool = os.getenv(
+        "SNOWFLAKE_MCP_SQL_API_FALLBACK", "true"
+    ).strip().lower() in {"1", "true", "yes", "on"}
 
     llm_provider: str = os.getenv("LLM_PROVIDER", "ollama")
     ollama_model: str = os.getenv("OLLAMA_MODEL", "llama3.1:8b")

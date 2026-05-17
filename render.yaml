@@ -1,8 +1,16 @@
 # Render Blueprint — deploy both services from this repo.
 # Dashboard: New → Blueprint → connect GitHub repo → Apply.
 #
-# After the first deploy, set secret env vars in the Render dashboard
-# (GROQ_API_KEY, SNOWFLAKE_*, SALESFORCE_*, DOCUSIGN_*, etc.).
+# After deploy or blueprint sync, set secrets in each service Environment tab.
+# Never commit PATs or API keys to this file.
+#
+# Snowflake (sr-workmind-backend):
+#   SNOWFLAKE_PAT          — paste new PAT when rotated (dashboard only)
+#   SNOWFLAKE_ACCOUNT      — e.g. FNIASFT-ENB84984
+#   SNOWFLAKE_DATABASE     — netflix_db
+#   SNOWFLAKE_SCHEMA       — PUBLIC
+#   SNOWFLAKE_WAREHOUSE    — COMPUTE_WH
+#   Leave SNOWFLAKE_ROLE unset (PAT uses mcp_client_role)
 
 services:
   - type: web
@@ -48,6 +56,8 @@ services:
           envVarKey: RENDER_EXTERNAL_URL
       - key: SNOWFLAKE_USE_SQL_API
         value: "false"
+      - key: SNOWFLAKE_MCP_SQL_API_FALLBACK
+        value: "true"
       - key: FRONTEND_ORIGIN
         fromService:
           name: sr-workmind-frontend
@@ -66,7 +76,11 @@ services:
         sync: false
       - key: SNOWFLAKE_WAREHOUSE
         sync: false
+      # Optional; leave empty so PAT default role (mcp_client_role) is used.
+      - key: SNOWFLAKE_ROLE
+        sync: false
       - key: SALESFORCE_INSTANCE_URL
+        sync: false
         sync: false
       - key: SALESFORCE_CONSUMER_KEY
         sync: false

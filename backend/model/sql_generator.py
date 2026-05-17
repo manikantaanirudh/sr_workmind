@@ -289,12 +289,13 @@ def generate_sql(prompt: str, intent: str, params: dict) -> tuple[str, str]:
         summary_sql = _build_summary_sql(expected_table)
         return _sanitize_llm_sql(summary_sql), "Deterministic:summary"
 
+    schema_hint = get_snowflake_schema_hint()
     llm_prompt = prompt
     last_sql = ""
     for _ in range(3):
         llm_sql = call_llm_for_sql(
             prompt=llm_prompt,
-            schema_hint=get_snowflake_schema_hint(),
+            schema_hint=schema_hint,
             action=action,
             expected_table=expected_table,
             insert_columns_hint=insert_columns_hint,

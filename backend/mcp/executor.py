@@ -43,7 +43,7 @@ def validate_via_mcp() -> str:
         sql_tool = resolve_snowflake_sql_tool(tools)
 
         return (
-            f"Passed — Snowflake hosted MCP Server verified | "
+            f"Passed - Snowflake hosted MCP Server verified | "
             f"SQL tool: {sql_tool} | Tools: {', '.join(tool_names[:8])}"
         )
     except RuntimeError:

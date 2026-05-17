@@ -56,13 +56,13 @@ def generate_soql(prompt: str, intent: str, params: dict) -> tuple[str, str]:
     if action == "schema":
         return f"DESCRIBE {sobject}" if sobject else "DESCRIBE ALL", "Deterministic:schema"
 
-    # Generate SOQL via LLM
+    object_hints = get_salesforce_schema_hint(sobject_name=str(sobject or ""))
     llm_prompt = prompt
     last_soql = ""
     for attempt in range(3):
         llm_soql = call_llm_for_soql(
             prompt=llm_prompt,
-            object_hints=get_salesforce_schema_hint(),
+            object_hints=object_hints,
             action=action,
             sobject_name=sobject,
         )
@@ -101,7 +101,7 @@ def _generate_sf_operation(
         prompt=prompt,
         action=action,
         sobject_name=sobject,
-        object_hints=get_salesforce_schema_hint(),
+        object_hints=get_salesforce_schema_hint(sobject_name=sobject),
     )
 
     # Return the JSON operation as the "SQL" field for display

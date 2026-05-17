@@ -20,8 +20,31 @@ import httpx
 import snowflake.connector
 
 from backend.config import settings
+from backend.mcp.mcp_protocol import decode_rpc_response
 
 logger = logging.getLogger(__name__)
+
+_TOOLS_LIST_CACHE: tuple[float, list[dict]] | None = None
+_TOOLS_CACHE_TTL_SEC = 300.0
+
+# Tracks how the last Snowflake query was executed (for UI connector label).
+_last_snowflake_execution_mode: str = "mcp"
+
+
+def get_snowflake_connector_label() -> str:
+    """Human-readable connector label for the last Snowflake execution."""
+    if _last_snowflake_execution_mode == "sql_api":
+        return "Snowflake SQL API (PAT)"
+    if _last_snowflake_execution_mode == "sql_api_fallback":
+        return (
+            "Snowflake Managed MCP Server "
+            "(sql_exec_tool unavailable - results via SQL API, same PAT)"
+        )
+    return "Snowflake Managed MCP Server"
+
+
+class SnowflakeMcpToolUnavailable(RuntimeError):
+    """Raised when hosted MCP sql_exec_tool fails (known account/server-side issue)."""
 
 # ---------------------------------------------------------------------------
 # Token cache (module-level singleton)
@@ -75,7 +98,7 @@ def _auth_headers() -> dict[str, str]:
     return {
         "Authorization": f"Bearer {pat}",
         "Content-Type": "application/json",
-        "Accept": "application/json",
+        "Accept": "application/json, text/event-stream",
         "X-Snowflake-Authorization-Token-Type": "PROGRAMMATIC_ACCESS_TOKEN",
     }
 
@@ -179,16 +202,13 @@ def _send_rpc(payload: dict, timeout: float = 120.0) -> dict:
     url = _build_mcp_url()
     headers = _auth_headers()
 
-    logger.info("MCP RPC -> %s  method=%s", url, payload.get("method"))
-    print(f"[MCP DEBUG] POST {url}")
-    print(f"[MCP DEBUG] Method: {payload.get('method')}")
-    print(f"[MCP DEBUG] Payload: {json.dumps(payload)}")
+    logger.info("MCP RPC -> %s method=%s", url, payload.get("method"))
+    logger.debug("MCP payload: %s", json.dumps(payload))
 
     with httpx.Client(timeout=timeout, follow_redirects=True, verify=False) as client:
         response = client.post(url, headers=headers, json=payload)
 
-    print(f"[MCP DEBUG] Response status: {response.status_code}")
-    print(f"[MCP DEBUG] Response body: {response.text}")
+    logger.debug("MCP response status=%s body=%s", response.status_code, response.text[:500])
 
     # Surface clear errors for common failure modes
     if response.status_code == 401:
@@ -210,7 +230,7 @@ def _send_rpc(payload: dict, timeout: float = 120.0) -> dict:
         )
 
     response.raise_for_status()
-    data = response.json()
+    data = decode_rpc_response(response)
 
     # Check for JSON-RPC level errors
     if "error" in data:
@@ -226,29 +246,33 @@ def _send_rpc(payload: dict, timeout: float = 120.0) -> dict:
 # Public API — Tool Discovery
 # ---------------------------------------------------------------------------
 
-def mcp_tools_list() -> list[dict]:
-    """Discover available tools on the Snowflake MCP Server.
+def mcp_tools_list(force_refresh: bool = False) -> list[dict]:
+    """Discover available tools on the Snowflake MCP Server (cached)."""
+    global _TOOLS_LIST_CACHE
+    if not force_refresh and _TOOLS_LIST_CACHE is not None:
+        cached_at, cached_tools = _TOOLS_LIST_CACHE
+        if time.time() - cached_at < _TOOLS_CACHE_TTL_SEC:
+            return cached_tools
 
-    Returns a list of tool descriptors, each with at least 'name' and 'description'.
-    """
     payload = _jsonrpc_request("tools/list")
     data = _send_rpc(payload, timeout=30.0)
 
     result = data.get("result", {})
     tools = result.get("tools", [])
     logger.info("MCP tools/list returned %d tool(s)", len(tools))
+    _TOOLS_LIST_CACHE = (time.time(), tools)
     return tools
 
 
 _sql_tool_schema_cache: dict[str, dict[str, Any]] = {}
 
 
-def _get_sql_tool_schema(tool_name: str) -> dict[str, Any]:
+def _get_sql_tool_schema(tool_name: str, tools: list[dict] | None = None) -> dict[str, Any]:
     """Return the input schema for a Snowflake MCP tool (cached per tool name)."""
     if tool_name in _sql_tool_schema_cache:
         return _sql_tool_schema_cache[tool_name]
 
-    for tool in mcp_tools_list():
+    for tool in tools or mcp_tools_list():
         if tool.get("name") == tool_name:
             _sql_tool_schema_cache[tool_name] = tool
             return tool
@@ -257,23 +281,23 @@ def _get_sql_tool_schema(tool_name: str) -> dict[str, Any]:
     return _sql_tool_schema_cache[tool_name]
 
 
-def _build_sql_tool_arguments(clean_sql: str, tool_name: str | None = None) -> dict[str, Any]:
-    """Build tools/call arguments using the MCP tool's declared input schema."""
-    from backend.mcp.tool_registry import resolve_snowflake_sql_tool
-
-    resolved_tool = tool_name or resolve_snowflake_sql_tool()
-    tool = _get_sql_tool_schema(resolved_tool)
+def _sql_argument_candidates(tool_name: str, tools: list[dict]) -> list[str]:
+    tool = _get_sql_tool_schema(tool_name, tools)
     schema = tool.get("inputSchema") or tool.get("input_schema") or {}
     properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
+    preferred = ["sql", "query", "statement"]
+    ordered = [key for key in preferred if key in properties]
+    return ordered or preferred
 
-    if "query" in properties:
-        return {"query": clean_sql}
-    if "sql" in properties:
-        return {"sql": clean_sql}
-    if "statement" in properties:
-        return {"statement": clean_sql}
 
-    return {"query": clean_sql}
+def _build_sql_tool_arguments(
+    clean_sql: str,
+    tool_name: str,
+    tools: list[dict],
+) -> dict[str, Any]:
+    """Build tools/call arguments using the MCP tool's declared input schema."""
+    candidates = _sql_argument_candidates(tool_name, tools)
+    return {candidates[0]: clean_sql}
 
 
 def _can_use_native_fallback() -> bool:
@@ -309,79 +333,105 @@ def mcp_tools_call(tool_name: str, arguments: dict[str, Any]) -> dict:
 # Public API — High-level SQL Execution
 # ---------------------------------------------------------------------------
 
-def execute_sql_via_mcp(sql: str) -> tuple[list[str], list[list[Any]]]:
-    """Execute SQL via Snowflake's hosted MCP server (tools/call).
+def _parse_mcp_tool_result(result: dict[str, Any], sql: str) -> tuple[list[str], list[list[Any]]]:
+    """Parse Snowflake MCP tools/call result (content + structuredContent)."""
+    if result.get("isError"):
+        content_list = result.get("content", [])
+        error_text = ""
+        if content_list and isinstance(content_list[0], dict):
+            error_text = str(content_list[0].get("text", "")).strip()
+        if "error parsing response" in error_text.lower():
+            raise SnowflakeMcpToolUnavailable(error_text)
+        raise RuntimeError(error_text or "Snowflake MCP tool returned an error.")
 
-    See: https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-agents-mcp
+    structured = result.get("structuredContent")
+    if isinstance(structured, dict):
+        if "columns" in structured and "rows" in structured:
+            return structured["columns"], structured["rows"]
+        if "data" in structured and isinstance(structured["data"], list):
+            data = structured["data"]
+            if data and isinstance(data[0], dict):
+                columns = list(data[0].keys())
+                rows = [[row.get(col) for col in columns] for row in data]
+                return columns, rows
 
-    Args:
-        sql: The SQL statement to execute.
-
-    Returns:
-        A tuple of ``(columns, rows)`` matching the existing frontend contract.
-    """
-    clean_sql = sql.strip()
-    if clean_sql.endswith(";"):
-        clean_sql = clean_sql[:-1]
-
-    from backend.mcp.tool_registry import resolve_snowflake_sql_tool
-
-    tool_name = resolve_snowflake_sql_tool()
-    arguments = _build_sql_tool_arguments(clean_sql, tool_name=tool_name)
-    logger.info("Snowflake MCP tools/call -> %s keys=%s", tool_name, list(arguments.keys()))
-
-    result = mcp_tools_call(tool_name, arguments)
-
-    # Parse the MCP response into columns + rows
-    # The SYSTEM_EXECUTE_SQL tool returns results in the "content" array.
     content_list = result.get("content", [])
-
     if not content_list:
-        # DML operations (INSERT, UPDATE, DELETE, CREATE) may return empty content
         return _handle_dml_response(sql)
-
-    # The MCP server returns tool results as content items.
-    # For SQL queries, the response typically contains text content.
-    columns: list[str] = []
-    rows: list[list[Any]] = []
 
     for item in content_list:
         item_type = item.get("type", "text")
-
         if item_type == "text":
             text = item.get("text", "")
-
-            if result.get("isError"):
-                error_msg = text.strip() or "Unknown MCP Server error"
-                if settings.snowflake_use_sql_api and settings.snowflake_pat.strip():
-                    logger.warning(
-                        "MCP error (%s). SNOWFLAKE_USE_SQL_API fallback enabled.",
-                        error_msg,
-                    )
-                    return _execute_sql_via_sql_api(clean_sql)
-                raise RuntimeError(f"Snowflake MCP SQL execution failed: {error_msg}")
-
             parsed = _try_parse_sql_result(text, sql)
             if parsed:
-                columns, rows = parsed
-                break
-            else:
-                # If we can't parse it as structured data, return as a status message
+                return parsed
+            if text.strip():
                 return ["status"], [[text]]
-
         elif item_type == "resource":
-            # Some MCP servers return embedded resources
             resource = item.get("resource", {})
             text = resource.get("text", "")
             parsed = _try_parse_sql_result(text, sql)
             if parsed:
-                columns, rows = parsed
-                break
+                return parsed
 
-    if not columns and not rows:
-        return _handle_dml_response(sql)
+    return _handle_dml_response(sql)
 
-    return columns, rows
+
+def _execute_sql_via_mcp_tools(sql: str, clean_sql: str) -> tuple[list[str], list[list[Any]]]:
+    from backend.mcp.tool_registry import resolve_snowflake_sql_tool
+
+    tools = mcp_tools_list()
+    tool_name = resolve_snowflake_sql_tool(tools)
+    arg_keys = _sql_argument_candidates(tool_name, tools)
+
+    last_error = ""
+    for arg_key in arg_keys:
+        arguments = {arg_key: clean_sql}
+        logger.info("Snowflake MCP tools/call -> %s(%s)", tool_name, arg_key)
+        try:
+            result = mcp_tools_call(tool_name, arguments)
+            return _parse_mcp_tool_result(result, sql)
+        except SnowflakeMcpToolUnavailable:
+            raise
+        except RuntimeError as exc:
+            last_error = str(exc)
+            if "parsing" not in last_error.lower():
+                raise
+            logger.warning("Snowflake MCP retry with arg %s failed: %s", arg_key, last_error)
+
+    raise RuntimeError(
+        last_error or f"Snowflake MCP SQL execution failed for tool '{tool_name}'."
+    )
+
+
+def execute_sql_via_mcp(sql: str) -> tuple[list[str], list[list[Any]]]:
+    """Execute SQL via Snowflake hosted MCP (tools/call), with SQL API fallback when needed."""
+    global _last_snowflake_execution_mode
+    clean_sql = sql.strip().rstrip(";")
+
+    if settings.snowflake_use_sql_api and settings.snowflake_pat.strip():
+        _last_snowflake_execution_mode = "sql_api"
+        return _execute_sql_via_sql_api(clean_sql)
+
+    try:
+        _last_snowflake_execution_mode = "mcp"
+        return _execute_sql_via_mcp_tools(sql, clean_sql)
+    except SnowflakeMcpToolUnavailable as exc:
+        if settings.snowflake_mcp_sql_api_fallback and settings.snowflake_pat.strip():
+            logger.warning(
+                "Snowflake MCP sql_exec_tool failed (%s); executing via SQL API (same PAT).",
+                exc,
+            )
+            _last_snowflake_execution_mode = "sql_api_fallback"
+            return _execute_sql_via_sql_api(clean_sql)
+        warehouse = settings.snowflake_warehouse.strip() or "COMPUTE_WH"
+        raise RuntimeError(
+            f"{exc}\n\n"
+            "Snowflake hosted MCP sql_exec_tool cannot execute SQL on this account. "
+            "Ensure MODIFY + USAGE on the MCP server for the PAT role, warehouse in tool config, "
+            "or set SNOWFLAKE_MCP_SQL_API_FALLBACK=true to use SQL API with the same PAT."
+        ) from exc
 
 
 def _execute_fallback_sql(sql: str) -> tuple[list[str], list[list[Any]]]:

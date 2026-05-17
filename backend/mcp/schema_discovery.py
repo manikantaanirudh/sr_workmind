@@ -50,16 +50,12 @@ def get_snowflake_schema_hint(force_refresh: bool = False) -> str:
     )
 
     sql = f"""
-SELECT
-  TABLE_NAME,
-  LISTAGG(COLUMN_NAME || ' ' || DATA_TYPE, ', ')
-    WITHIN GROUP (ORDER BY ORDINAL_POSITION) AS COLUMNS
+SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE
 FROM INFORMATION_SCHEMA.COLUMNS
 WHERE {schema_predicate}
   AND TABLE_CATALOG = CURRENT_DATABASE()
-GROUP BY TABLE_NAME
-ORDER BY TABLE_NAME
-LIMIT 100
+ORDER BY TABLE_NAME, ORDINAL_POSITION
+LIMIT 400
 """.strip()
 
     try:
@@ -70,13 +66,20 @@ LIMIT 100
                 "via INFORMATION_SCHEMA. Use only tables that exist in the connected account."
             )
         else:
-            parts: list[str] = []
+            table_cols: dict[str, list[str]] = {}
             for row in rows:
-                if len(row) >= 2:
-                    parts.append(f"{row[0]}({row[1]})")
-                elif row:
-                    parts.append(str(row[0]))
-            hint = "; ".join(parts)
+                if len(row) < 2:
+                    continue
+                table_name = str(row[0])
+                col_desc = str(row[1])
+                if len(row) >= 3 and row[2]:
+                    col_desc = f"{row[1]} {row[2]}"
+                table_cols.setdefault(table_name, []).append(col_desc)
+            parts = [
+                f"{table}({', '.join(cols)})"
+                for table, cols in sorted(table_cols.items())
+            ]
+            hint = "; ".join(parts[:100])
     except Exception as exc:
         logger.warning("Snowflake schema discovery via MCP failed: %s", exc)
         hint = (
@@ -88,8 +91,11 @@ LIMIT 100
     return hint
 
 
-def get_salesforce_schema_hint(force_refresh: bool = False) -> str:
-    """Build object/field hints using Salesforce hosted MCP getObjectSchema (index mode)."""
+def get_salesforce_schema_hint(
+    force_refresh: bool = False,
+    sobject_name: str = "",
+) -> str:
+    """Schema hint for SOQL generation (cached; avoids slow getObjectSchema on every prompt)."""
     env_override = settings.salesforce_object_hints.strip()
     if env_override:
         return env_override
@@ -99,24 +105,15 @@ def get_salesforce_schema_hint(force_refresh: bool = False) -> str:
         if cached:
             return cached
 
-    from backend.mcp.salesforce_oauth import is_authenticated
-
-    if not is_authenticated():
-        return (
-            "Salesforce not connected. Standard objects include Account, Contact, "
-            "Opportunity, Lead, Case, Task — use fields from the target object schema."
-        )
-
-    from backend.mcp.salesforce_mcp_client import get_sf_schema
-
-    try:
-        _columns, rows = get_sf_schema("")
-        hint = _format_sf_schema_rows(rows)
-    except Exception as exc:
-        logger.warning("Salesforce schema discovery via MCP failed: %s", exc)
+    if sobject_name:
         hint = (
-            "Schema discovery unavailable. Use standard Salesforce objects and fields "
-            "per the authenticated user's permissions."
+            f"Target object: {sobject_name}. Use valid API field names for {sobject_name} "
+            "(include Id, Name where applicable). LIMIT 200."
+        )
+    else:
+        hint = (
+            "Use valid Salesforce object and field API names per the authenticated user. "
+            "LIMIT 200."
         )
 
     _write_cache("salesforce", hint)

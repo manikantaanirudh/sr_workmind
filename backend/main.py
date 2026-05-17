@@ -10,6 +10,7 @@ from fastapi.responses import RedirectResponse, HTMLResponse
 from backend.config import settings
 from backend.intent.classifier import classify_intent
 from backend.mcp.executor import governance_log, route_and_execute, validate_via_mcp
+from backend.mcp.mcp_client import get_snowflake_connector_label
 from backend.mcp.docusign_executor import ds_governance_log, ds_route_and_execute, ds_validate_via_mcp
 from backend.mcp.docusign_mcp_client import ds_mcp_tools_list
 from backend.mcp.docusign_oauth import (
@@ -271,14 +272,17 @@ def execute(request: ExecuteRequest) -> ExecuteResponse:
 
 def _execute_snowflake(prompt: str, intent_payload: dict, started: float) -> ExecuteResponse:
     """Execute a Snowflake query through the Snowflake MCP Server."""
-    # --- Step 2: Generate SQL via LLM ---
+    # --- Step 2: Validate MCP (cached tools/list) ---
+    mcp_status = validate_via_mcp()
+
+    # --- Step 3: Generate SQL via LLM (schema from MCP INFORMATION_SCHEMA, cached) ---
     sql, selected_model = generate_sql(
         prompt=prompt,
         intent=intent_payload["intent"],
         params=intent_payload["parameters"],
     )
 
-    # --- Step 3: Determine the SQL action from the generated query ---
+    # --- Step 4: Determine the SQL action from the generated query ---
     sql_action = "query"
     sql_head = sql.strip().split(None, 1)[0].lower() if sql.strip() else ""
     if sql_head == "create":
@@ -302,13 +306,10 @@ def _execute_snowflake(prompt: str, intent_payload: dict, started: float) -> Exe
 
     intent_payload["action"] = sql_action
 
-    # --- Step 4: Validate MCP Server is reachable ---
-    mcp_status = validate_via_mcp()
-
     # --- Step 5: Log to local governance audit trail ---
     governance_log(prompt, sql)
 
-    # --- Step 6: Execute SQL through Snowflake MCP Server ---
+    # --- Step 6: Execute SQL through Snowflake MCP Server (tools/call) ---
     columns, rows = route_and_execute(intent_payload["platform"], sql)
     safe_rows = json_safe_rows(rows)
     message = build_user_message(intent_payload["intent"], safe_rows)
@@ -320,7 +321,7 @@ def _execute_snowflake(prompt: str, intent_payload: dict, started: float) -> Exe
         result=QueryResultPayload(columns=columns, rows=safe_rows),
         message=message,
         model=selected_model,
-        connector="Snowflake Managed MCP Server",
+        connector=get_snowflake_connector_label(),
         mcp_validation=mcp_status,
         execution_time_sec=elapsed,
         security_checks=["MCP Server RBAC", "OAuth/PAT Auth", "Audit Logged"],
@@ -336,15 +337,15 @@ def _execute_salesforce(prompt: str, intent_payload: dict, started: float) -> Ex
     action = intent_payload.get("action", "query")
     params = intent_payload.get("parameters", {})
 
-    # --- Step 2: Generate SOQL or operation descriptor via LLM ---
+    # --- Step 2: Validate Salesforce MCP (cached tools/list + OAuth) ---
+    mcp_status = sf_validate_via_mcp()
+
+    # --- Step 3: Generate SOQL or operation descriptor via LLM ---
     soql_or_op, selected_model = generate_soql(
         prompt=prompt,
         intent=intent_payload["intent"],
         params=params,
     )
-
-    # --- Step 3: Validate Salesforce MCP Server ---
-    mcp_status = sf_validate_via_mcp()
 
     # --- Step 4: Log to Salesforce audit trail ---
     sf_governance_log(prompt, soql_or_op)
