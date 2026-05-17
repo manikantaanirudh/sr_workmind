@@ -386,7 +386,7 @@ def _execute_salesforce(prompt: str, intent_payload: dict, started: float) -> Ex
         result=QueryResultPayload(columns=columns, rows=safe_rows),
         message=message,
         model=selected_model,
-        connector="Salesforce Hosted MCP Server",
+        connector="Salesforce REST API (SOQL)",
         mcp_validation=mcp_status,
         execution_time_sec=elapsed,
         security_checks=["MCP Server RBAC", "OAuth 2.0 PKCE", "Audit Logged"],

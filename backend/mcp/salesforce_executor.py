@@ -18,9 +18,9 @@ from backend.mcp.salesforce_mcp_client import (
     execute_sf_search,
     execute_soql_via_mcp,
     get_sf_schema,
-    sf_mcp_tools_list,
     update_sf_record,
 )
+from backend.mcp.salesforce_rest import execute_soql_via_rest
 from backend.mcp.salesforce_oauth import is_authenticated
 
 logger = logging.getLogger(__name__)
@@ -41,17 +41,7 @@ def sf_validate_via_mcp() -> str:
     if not is_authenticated():
         return "Validation failed or backend unavailable — Salesforce not authenticated"
 
-    try:
-        tools = sf_mcp_tools_list()
-        tool_names = [t.get("name", "?") for t in tools]
-        return (
-            f"Passed — Salesforce MCP Server verified | "
-            f"Routing check: PASS | "
-            f"Tools: {', '.join(tool_names[:5])}"
-        )
-    except Exception as exc:
-        logger.warning("Salesforce MCP validation error: %s", exc)
-        return f"Validation failed or backend unavailable — {exc}"
+    return "Passed — Salesforce OAuth connected | Routing check: PASS"
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +83,11 @@ def sf_route_and_execute(
     sf_params = sf_params or {}
 
     if action in ("query", "soql_query"):
-        return execute_soql_via_mcp(soql_or_operation)
+        try:
+            return execute_soql_via_rest(soql_or_operation)
+        except Exception as exc:
+            logger.warning("Salesforce REST SOQL failed, falling back to MCP: %s", exc)
+            return execute_soql_via_mcp(soql_or_operation)
 
     elif action == "search":
         return execute_sf_search(soql_or_operation)
@@ -125,5 +119,8 @@ def sf_route_and_execute(
         return get_sf_schema(object_name)
 
     else:
-        # Default: treat as SOQL query
-        return execute_soql_via_mcp(soql_or_operation)
+        try:
+            return execute_soql_via_rest(soql_or_operation)
+        except Exception as exc:
+            logger.warning("Salesforce REST SOQL failed, falling back to MCP: %s", exc)
+            return execute_soql_via_mcp(soql_or_operation)

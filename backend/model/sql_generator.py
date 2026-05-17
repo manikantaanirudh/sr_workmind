@@ -53,8 +53,10 @@ def _quote_reserved_projection_identifiers(sql: str) -> str:
     return f"SELECT {', '.join(rewritten)}{tail}"
 
 
-def _fix_netflix_table_references(sql: str, expected_table: str = "") -> str:
-    """Map common LLM mistakes to the actual Snowflake table name."""
+def _fix_netflix_table_references(sql: str, expected_table: str = "", action: str = "query") -> str:
+    """Map common LLM mistakes to the actual Snowflake table name (SELECT/aggregate only)."""
+    if action == "create" or _sql_head(sql) == "create":
+        return sql
     fixed = sql
     table_clause = r"(FROM|JOIN|INTO|UPDATE|DELETE\s+FROM)"
     for wrong_name in ("MOVIES", "movies", "MOVIE", "movie", "NETFLIX", "netflix"):
@@ -73,14 +75,14 @@ def _fix_netflix_table_references(sql: str, expected_table: str = "") -> str:
     return fixed
 
 
-def _sanitize_llm_sql(sql_text: str, expected_table: str = "") -> str:
+def _sanitize_llm_sql(sql_text: str, expected_table: str = "", action: str = "auto") -> str:
     sql = sql_text.strip().strip("`")
     sql = sql.replace("```sql", "").replace("```", "").strip()
     lower_sql = sql.lower()
     if lower_sql.startswith("sql"):
         sql = sql[3:].strip()
     sql = _quote_reserved_projection_identifiers(sql)
-    sql = _fix_netflix_table_references(sql, expected_table)
+    sql = _fix_netflix_table_references(sql, expected_table, action)
     if ";" in sql:
         sql = sql.split(";")[0] + ";"
     elif sql:
@@ -139,18 +141,31 @@ def _extract_sql_table(sql: str, action: str) -> str:
         return ""
 
 
+def _effective_sql_action(action: str, sql: str) -> str:
+    """Infer statement type when classifier used action_hint=auto."""
+    if action != "auto":
+        return action
+    head = _sql_head(sql)
+    if head in {"select", "with"}:
+        return "query"
+    if head in {"create", "insert", "update", "delete"}:
+        return head
+    return action
+
+
 def _matches_expected_table(sql: str, action: str, expected_table: str) -> bool:
     if not expected_table:
         return True
-    
-    # We do not strictly validate the table name for SELECT queries because
-    # extracting table names from complex FROM/JOIN clauses is error-prone.
-    if action == "query":
+
+    effective = _effective_sql_action(action, sql)
+
+    # SELECT queries may reference the expected table in FROM/JOIN; do not enforce exact name.
+    if effective == "query":
         return True
-        
-    sql_table = _extract_sql_table(sql, action)
+
+    sql_table = _extract_sql_table(sql, effective if effective != "auto" else action)
     if not sql_table:
-        return False
+        return effective != "create"
     return sql_table == _normalize_identifier(expected_table)
 
 
@@ -282,7 +297,8 @@ def generate_sql(prompt: str, intent: str, params: dict) -> tuple[str, str]:
     raw_sql = params.get("raw_sql")
     expected_table_early = str(params.get("expected_table", "")).strip()
     if raw_sql:
-        return _sanitize_llm_sql(str(raw_sql), expected_table_early), "DirectSQL"
+        action_early = str(params.get("action_hint", "auto")).lower()
+        return _sanitize_llm_sql(str(raw_sql), expected_table_early, action_early), "DirectSQL"
 
     # Dynamic-by-default path: let the configured LLM derive SQL from natural-language intent.
     action = str(params.get("action_hint", "auto")).lower()
@@ -307,12 +323,13 @@ def generate_sql(prompt: str, intent: str, params: dict) -> tuple[str, str]:
             expected_table=expected_table,
             insert_columns_hint=insert_columns_hint,
         )
-        sanitized = _sanitize_llm_sql(llm_sql, expected_table)
+        sanitized = _sanitize_llm_sql(llm_sql, expected_table, action)
         last_sql = sanitized
+        effective = _effective_sql_action(action, sanitized)
         if (
             _matches_action(sanitized, action)
             and _matches_expected_table(sanitized, action, expected_table)
-            and _matches_insert_columns(sanitized, action, insert_columns_hint)
+            and _matches_insert_columns(sanitized, effective, insert_columns_hint)
         ):
             return sanitized, f"LLM:{settings.llm_provider}"
         llm_prompt = _strict_retry_prompt(

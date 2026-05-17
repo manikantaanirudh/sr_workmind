@@ -29,8 +29,15 @@ async function proxy(request: NextRequest, pathSegments: string[]) {
     init.body = await request.arrayBuffer();
   }
 
+  const controller = new AbortController();
+  const timeoutMs = 120_000;
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
   try {
-    const upstream = await fetch(target, init);
+    const upstream = await fetch(target, {
+      ...init,
+      signal: controller.signal,
+    });
 
     if (upstream.status >= 300 && upstream.status < 400) {
       const location = upstream.headers.get("location");
@@ -50,12 +57,17 @@ async function proxy(request: NextRequest, pathSegments: string[]) {
   } catch (error) {
     const message =
       error instanceof Error ? error.message : "Failed to reach backend service";
+    const timedOut = error instanceof Error && error.name === "AbortError";
     return NextResponse.json(
       {
-        detail: `Backend proxy error (${getBackendBaseUrl()}): ${message}`,
+        detail: timedOut
+          ? `Backend request timed out after ${timeoutMs / 1000}s (${getBackendBaseUrl()}).`
+          : `Backend proxy error (${getBackendBaseUrl()}): ${message}`,
       },
-      { status: 502 },
+      { status: timedOut ? 504 : 502 },
     );
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
 

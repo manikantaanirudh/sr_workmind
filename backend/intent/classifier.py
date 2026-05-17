@@ -1,3 +1,4 @@
+import re
 from typing import Any
 
 
@@ -32,7 +33,31 @@ def _infer_action_hint(prompt: str) -> str:
         return "delete"
     if any(word in text for word in ["update", "modify", "change"]):
         return "update"
-    if any(word in text for word in ["select", "show", "list", "get", "find", "retrieve", "summarize", "summary", "profile"]):
+    if any(
+        word in text
+        for word in [
+            "select",
+            "show",
+            "list",
+            "get",
+            "find",
+            "retrieve",
+            "summarize",
+            "summary",
+            "profile",
+            "top",
+            "most",
+            "least",
+            "count",
+            "how many",
+            "which",
+            "what are",
+            "oldest",
+            "newest",
+            "average",
+            "total",
+        ]
+    ):
         return "query"
     return "auto"
 
@@ -84,11 +109,54 @@ def _find_identifier_after(tokens: list[str], anchor: str, skip_words: set[str],
     return None
 
 
-def _extract_table_hint(prompt: str, action_hint: str) -> str | None:
+def _extract_create_table_name(prompt: str) -> str | None:
+    """Extract target table name from CREATE TABLE prompts."""
+    normalized = _normalize_prompt_text(prompt).lower()
+    tokens = normalized.split()
+    skip_words = {
+        "the",
+        "a",
+        "an",
+        "new",
+        "with",
+        "columns",
+        "column",
+        "for",
+        "as",
+        "integer",
+        "int",
+        "string",
+        "varchar",
+        "date",
+        "and",
+    }
+    for index, token in enumerate(tokens):
+        if token != "table" or index + 1 >= len(tokens):
+            continue
+        candidate = _clean_identifier(tokens[index + 1])
+        if _is_identifier_token(candidate) and candidate.lower() not in skip_words:
+            return candidate.upper()
+    return None
+
+
+def _is_netflix_dataset_prompt(prompt: str) -> bool:
     lowered = prompt.lower()
     if "netflix_table" in lowered or "netflix table" in lowered:
-        return "NETFLIX_TABLE"
-    if "netflix" in lowered:
+        return True
+    if re.search(r"\bon\s+netflix\b", lowered):
+        return True
+    if re.search(r"\bnetflix\s+dataset\b", lowered):
+        return True
+    return False
+
+
+def _extract_table_hint(prompt: str, action_hint: str) -> str | None:
+    if action_hint == "create":
+        created = _extract_create_table_name(prompt)
+        if created:
+            return created
+
+    if action_hint != "create" and _is_netflix_dataset_prompt(prompt):
         return "NETFLIX_TABLE"
 
     normalized = _normalize_prompt_text(prompt).lower()
