@@ -162,6 +162,44 @@ def mcp_tools_list() -> list[dict]:
     return tools
 
 
+_sql_tool_schema_cache: dict[str, Any] | None = None
+
+
+def _get_sql_tool_schema() -> dict[str, Any]:
+    """Return the input schema for the configured SQL MCP tool (cached)."""
+    global _sql_tool_schema_cache
+    if _sql_tool_schema_cache is not None:
+        return _sql_tool_schema_cache
+
+    expected_tool = settings.mcp_tool_name.strip()
+    for tool in mcp_tools_list():
+        if tool.get("name") == expected_tool:
+            _sql_tool_schema_cache = tool
+            return tool
+
+    _sql_tool_schema_cache = {}
+    return _sql_tool_schema_cache
+
+
+def _build_sql_tool_arguments(clean_sql: str) -> dict[str, Any]:
+    """Build tools/call arguments using the MCP tool's declared input schema."""
+    tool = _get_sql_tool_schema()
+    schema = tool.get("inputSchema") or tool.get("input_schema") or {}
+    properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
+
+    if "query" in properties:
+        return {"query": clean_sql}
+    if "sql" in properties:
+        return {"sql": clean_sql}
+
+    # Snowflake SYSTEM_EXECUTE_SQL expects `query` (see Snowflake MCP docs).
+    return {"query": clean_sql}
+
+
+def _can_use_native_fallback() -> bool:
+    return bool(settings.snowflake_user.strip() and settings.snowflake_password.strip())
+
+
 # ---------------------------------------------------------------------------
 # Public API — Tool Invocation
 # ---------------------------------------------------------------------------
@@ -210,13 +248,9 @@ def execute_sql_via_mcp(sql: str) -> tuple[list[str], list[list[Any]]]:
     if clean_sql.endswith(";"):
         clean_sql = clean_sql[:-1]
         
-    arguments = {
-        "sql": clean_sql,
-        "database": settings.snowflake_database.strip().upper(),
-        "schema": settings.snowflake_schema.strip().upper(),
-        "warehouse": settings.snowflake_warehouse.strip().upper() if settings.snowflake_warehouse else "COMPUTE_WH"
-    }
-        
+    arguments = _build_sql_tool_arguments(clean_sql)
+    logger.info("MCP tools/call arguments keys: %s", list(arguments.keys()))
+
     result = mcp_tools_call(tool_name, arguments)
 
     # Parse the MCP response into columns + rows
@@ -237,12 +271,17 @@ def execute_sql_via_mcp(sql: str) -> tuple[list[str], list[list[Any]]]:
 
         if item_type == "text":
             text = item.get("text", "")
-            
-            # If the MCP server threw an internal error, trigger the fallback
-            if result.get("isError") and "Error parsing response" in text:
-                print(f"[MCP WARNING] Server returned parsing error. Falling back to native connector...")
-                return _execute_fallback_sql(clean_sql)
-                
+
+            if result.get("isError"):
+                error_msg = text.strip() or "Unknown MCP Server error"
+                if _can_use_native_fallback():
+                    logger.warning(
+                        "MCP error (%s). Attempting native Snowflake fallback.",
+                        error_msg,
+                    )
+                    return _execute_fallback_sql(clean_sql)
+                raise RuntimeError(f"MCP SQL execution failed: {error_msg}")
+
             parsed = _try_parse_sql_result(text, sql)
             if parsed:
                 columns, rows = parsed
@@ -269,13 +308,18 @@ def execute_sql_via_mcp(sql: str) -> tuple[list[str], list[list[Any]]]:
 def _execute_fallback_sql(sql: str) -> tuple[list[str], list[list[Any]]]:
     """Execute SQL using the native Snowflake connector if the MCP server fails."""
     import snowflake.connector
-    
-    # Use standard username/password for native connector
+
     user = settings.snowflake_user.strip()
     password = settings.snowflake_password.strip()
     account = settings.snowflake_account.strip()
-    
-    print(f"[MCP FALLBACK] Executing SQL directly via python connector...")
+
+    if not user or not password:
+        raise RuntimeError(
+            "MCP Server failed and native fallback is not configured. "
+            "Set SNOWFLAKE_USER and SNOWFLAKE_PASSWORD, or fix SNOWFLAKE_PAT / MCP server access."
+        )
+
+    print("[MCP FALLBACK] Executing SQL directly via python connector...")
     try:
         with snowflake.connector.connect(
             user=user,

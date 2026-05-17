@@ -57,6 +57,8 @@ services:
         sync: false
       - key: SNOWFLAKE_PAT
         sync: false
+      - key: SNOWFLAKE_WAREHOUSE
+        sync: false
       - key: SALESFORCE_INSTANCE_URL
         sync: false
       - key: SALESFORCE_CONSUMER_KEY
@@ -78,9 +80,9 @@ services:
     envVars:
       - key: NODE_VERSION
         value: "20.18.0"
-      # Internal Render network URL (read at request time by src/app/api/[...path]/route.ts).
+      # Public backend URL (reliable across Render regions/plans).
       - key: BACKEND_API_BASE_URL
         fromService:
           name: sr-workmind-backend
           type: web
-          property: hostport
+          envVarKey: RENDER_EXTERNAL_URL

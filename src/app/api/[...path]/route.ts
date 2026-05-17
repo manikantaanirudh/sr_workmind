@@ -29,14 +29,25 @@ async function proxy(request: NextRequest, pathSegments: string[]) {
     init.body = await request.arrayBuffer();
   }
 
-  const upstream = await fetch(target, init);
-  const responseHeaders = new Headers(upstream.headers);
+  try {
+    const upstream = await fetch(target, init);
+    const responseHeaders = new Headers(upstream.headers);
 
-  return new NextResponse(upstream.body, {
-    status: upstream.status,
-    statusText: upstream.statusText,
-    headers: responseHeaders,
-  });
+    return new NextResponse(upstream.body, {
+      status: upstream.status,
+      statusText: upstream.statusText,
+      headers: responseHeaders,
+    });
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "Failed to reach backend service";
+    return NextResponse.json(
+      {
+        detail: `Backend proxy error (${getBackendBaseUrl()}): ${message}`,
+      },
+      { status: 502 },
+    );
+  }
 }
 
 type RouteContext = { params: Promise<{ path: string[] }> };

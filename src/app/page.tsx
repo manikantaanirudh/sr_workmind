@@ -70,6 +70,29 @@ type ThinkingStep = {
   status: "pending" | "running" | "done";
 };
 
+async function readApiError(response: Response): Promise<string> {
+  const errorText = await response.text();
+  if (!errorText) {
+    return `Request failed (${response.status})`;
+  }
+  try {
+    const parsed = JSON.parse(errorText) as {
+      detail?: string | Array<{ msg?: string }>;
+      message?: string;
+    };
+    const { detail } = parsed;
+    if (typeof detail === "string") {
+      return detail;
+    }
+    if (Array.isArray(detail)) {
+      return detail.map((item) => item.msg ?? JSON.stringify(item)).join("; ");
+    }
+    return parsed.message ?? errorText;
+  } catch {
+    return errorText;
+  }
+}
+
 const platforms: { id: PlatformId; label: string; badge: string }[] = [
   { id: "snowflake", label: "Snowflake", badge: "SF" },
   { id: "salesforce", label: "Salesforce", badge: "SA" },
@@ -364,8 +387,7 @@ export default function Home() {
       });
 
       if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(errorText || "Execution failed");
+        throw new Error(await readApiError(response));
       }
 
       const payload = (await response.json()) as ExecuteApiResponse;
