@@ -42,6 +42,8 @@ backend/.env
 .venv/
 backend/.venv/
 backend/logs/
+__pycache__/
+*.py[cod]
 
 # vercel
 .vercel
