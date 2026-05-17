@@ -86,3 +86,9 @@ services:
           name: sr-workmind-backend
           type: web
           envVarKey: RENDER_EXTERNAL_URL
+      # OAuth connect buttons link directly to the backend (avoids proxy redirect issues).
+      - key: NEXT_PUBLIC_BACKEND_URL
+        fromService:
+          name: sr-workmind-backend
+          type: web
+          envVarKey: RENDER_EXTERNAL_URL

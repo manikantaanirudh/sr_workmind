@@ -77,12 +77,18 @@ async function readApiError(response: Response): Promise<string> {
   }
   try {
     const parsed = JSON.parse(errorText) as {
-      detail?: string | Array<{ msg?: string }>;
+      detail?: string | Array<{ msg?: string }> | { detail?: string };
       message?: string;
     };
     const { detail } = parsed;
     if (typeof detail === "string") {
       return detail;
+    }
+    if (detail && typeof detail === "object" && "detail" in detail) {
+      const nested = (detail as { detail?: string }).detail;
+      if (typeof nested === "string") {
+        return nested;
+      }
     }
     if (Array.isArray(detail)) {
       return detail.map((item) => item.msg ?? JSON.stringify(item)).join("; ");
@@ -335,6 +341,15 @@ export default function Home() {
   const [dsAuthenticated, setDsAuthenticated] = useState(false);
 
   const apiBase = "/api";
+  const backendPublicUrl = (
+    process.env.NEXT_PUBLIC_BACKEND_URL ?? ""
+  ).replace(/\/$/, "");
+  const salesforceAuthUrl = backendPublicUrl
+    ? `${backendPublicUrl}/auth/salesforce`
+    : `${apiBase}/auth/salesforce`;
+  const docusignAuthUrl = backendPublicUrl
+    ? `${backendPublicUrl}/auth/docusign`
+    : `${apiBase}/auth/docusign`;
   const promptSuggestions = suggestionsFor(activePlatform);
 
   // Check external connector auth status on mount
@@ -930,7 +945,7 @@ export default function Home() {
                       executing commands.
                     </p>
                     <a
-                      href={`${apiBase}/auth/salesforce`}
+                      href={salesforceAuthUrl}
                       target="_blank"
                       rel="noopener noreferrer"
                       className="mt-3 inline-block rounded-lg bg-[#00a1e0] px-4 py-2 text-xs font-bold text-white transition hover:bg-[#008cbf]"
@@ -949,7 +964,7 @@ export default function Home() {
                       Connect Docusign via OAuth 2.0 before running MCP tools.
                     </p>
                     <a
-                      href={`${apiBase}/auth/docusign`}
+                      href={docusignAuthUrl}
                       target="_blank"
                       rel="noopener noreferrer"
                       className="mt-3 inline-block rounded-lg bg-[#4c00ff] px-4 py-2 text-xs font-bold text-white transition hover:brightness-110"

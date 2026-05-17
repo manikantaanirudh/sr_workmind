@@ -68,16 +68,88 @@ def _build_mcp_url() -> str:
 def _auth_headers() -> dict[str, str]:
     """Return authorisation headers using a Programmatic Access Token (PAT)."""
     pat = settings.snowflake_pat.strip()
-    
+
     if not pat:
         raise RuntimeError("SNOWFLAKE_PAT is required in .env for MCP Server authentication.")
-        
+
     return {
         "Authorization": f"Bearer {pat}",
         "Content-Type": "application/json",
         "Accept": "application/json",
         "X-Snowflake-Authorization-Token-Type": "PROGRAMMATIC_ACCESS_TOKEN",
     }
+
+
+def _sql_api_url() -> str:
+    return f"https://{_get_account_host()}/api/v2/statements"
+
+
+def _poll_sql_api_statement(client: httpx.Client, status_path: str) -> dict[str, Any]:
+    """Poll Snowflake SQL API until a statement completes."""
+    if status_path.startswith("http://") or status_path.startswith("https://"):
+        url = status_path
+    else:
+        url = f"https://{_get_account_host()}{status_path}"
+    headers = _auth_headers()
+
+    for _ in range(60):
+        response = client.get(url, headers=headers)
+        if response.status_code == 200:
+            return response.json()
+        if response.status_code == 202:
+            time.sleep(1)
+            continue
+        response.raise_for_status()
+
+    raise RuntimeError("Snowflake SQL API statement timed out while polling for results.")
+
+
+def _execute_sql_via_sql_api(sql: str) -> tuple[list[str], list[list[Any]]]:
+    """Execute SQL through Snowflake SQL API using PAT (no username/password)."""
+    clean_sql = sql.strip().rstrip(";")
+    body: dict[str, Any] = {
+        "statement": clean_sql,
+        "timeout": 120,
+        "database": settings.snowflake_database.strip().upper(),
+        "schema": settings.snowflake_schema.strip().upper(),
+    }
+    warehouse = settings.snowflake_warehouse.strip().upper()
+    if warehouse:
+        body["warehouse"] = warehouse
+    role = settings.snowflake_role.strip()
+    if role:
+        body["role"] = role
+
+    headers = _auth_headers()
+    logger.info("Snowflake SQL API fallback -> %s", _sql_api_url())
+
+    with httpx.Client(timeout=120.0, follow_redirects=True) as client:
+        response = client.post(_sql_api_url(), headers=headers, json=body)
+
+        if response.status_code == 422:
+            payload = response.json()
+            raise RuntimeError(payload.get("message", response.text))
+
+        if response.status_code == 202:
+            payload = response.json()
+            status_path = payload.get("statementStatusUrl", "")
+            if not status_path:
+                raise RuntimeError(
+                    "Snowflake SQL API returned async handle without status URL."
+                )
+            payload = _poll_sql_api_statement(client, status_path)
+
+        elif response.status_code != 200:
+            response.raise_for_status()
+        else:
+            payload = response.json()
+
+    row_type = payload.get("resultSetMetaData", {}).get("rowType", [])
+    columns = [str(col.get("name", "")) for col in row_type]
+    rows = payload.get("data", [])
+    if not columns and not rows:
+        return _handle_dml_response(sql)
+    return columns, rows
 
 
 # ---------------------------------------------------------------------------
@@ -274,9 +346,15 @@ def execute_sql_via_mcp(sql: str) -> tuple[list[str], list[list[Any]]]:
 
             if result.get("isError"):
                 error_msg = text.strip() or "Unknown MCP Server error"
+                if settings.snowflake_pat.strip():
+                    logger.warning(
+                        "MCP error (%s). Attempting Snowflake SQL API fallback.",
+                        error_msg,
+                    )
+                    return _execute_sql_via_sql_api(clean_sql)
                 if _can_use_native_fallback():
                     logger.warning(
-                        "MCP error (%s). Attempting native Snowflake fallback.",
+                        "MCP error (%s). Attempting native Snowflake connector fallback.",
                         error_msg,
                     )
                     return _execute_fallback_sql(clean_sql)

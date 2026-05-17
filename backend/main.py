@@ -65,9 +65,12 @@ def health() -> dict[str, str]:
 @app.get("/auth/salesforce")
 def salesforce_auth_init(request: Request):
     """Redirect the user to Salesforce login page for OAuth authorization."""
-    callback_url = _external_base_url(request) + "/oauth/salesforce/callback"
-    auth_url = get_salesforce_auth_url(redirect_uri=callback_url)
-    return RedirectResponse(url=auth_url)
+    try:
+        callback_url = _external_base_url(request) + "/oauth/salesforce/callback"
+        auth_url = get_salesforce_auth_url(redirect_uri=callback_url)
+        return RedirectResponse(url=auth_url)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/oauth/salesforce/callback")
@@ -107,9 +110,12 @@ def salesforce_auth_status():
 @app.get("/auth/docusign")
 def docusign_auth_init(request: Request):
     """Redirect the user to Docusign login page for OAuth authorization."""
-    callback_url = _external_base_url(request) + "/oauth/docusign/callback"
-    auth_url = get_docusign_auth_url(redirect_uri=callback_url)
-    return RedirectResponse(url=auth_url)
+    try:
+        callback_url = _external_base_url(request) + "/oauth/docusign/callback"
+        auth_url = get_docusign_auth_url(redirect_uri=callback_url)
+        return RedirectResponse(url=auth_url)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/oauth/docusign/callback")

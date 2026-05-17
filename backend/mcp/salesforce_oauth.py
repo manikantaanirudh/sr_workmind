@@ -36,8 +36,36 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 _TOKEN_FILE = Path(settings.token_storage_dir) / "salesforce_tokens.json"
 
-# In-memory PKCE state (used during the OAuth redirect flow)
+# PKCE state for the OAuth redirect flow (persisted for Render/serverless)
 _pkce_state: dict[str, str] = {}
+_PKCE_FILE = Path(settings.token_storage_dir) / "salesforce_pkce.json"
+
+
+def _save_pkce_state() -> None:
+    _PKCE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _PKCE_FILE.write_text(json.dumps(_pkce_state), encoding="utf-8")
+
+
+def _load_pkce_state() -> None:
+    global _pkce_state
+    if not _PKCE_FILE.exists():
+        return
+    try:
+        loaded = json.loads(_PKCE_FILE.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            _pkce_state = {str(k): str(v) for k, v in loaded.items()}
+    except (json.JSONDecodeError, OSError):
+        _pkce_state = {}
+
+
+def _clear_pkce_state() -> None:
+    global _pkce_state
+    _pkce_state = {}
+    if _PKCE_FILE.exists():
+        try:
+            _PKCE_FILE.unlink()
+        except OSError:
+            pass
 
 
 def _load_tokens() -> dict[str, Any]:
@@ -96,10 +124,11 @@ def get_salesforce_auth_url(redirect_uri: str) -> str:
     code_challenge = _generate_code_challenge(code_verifier)
     state = secrets.token_urlsafe(32)
 
-    # Store PKCE state for the callback
+    # Store PKCE state for the callback (persisted — Render restarts wipe memory)
     _pkce_state["code_verifier"] = code_verifier
     _pkce_state["state"] = state
     _pkce_state["redirect_uri"] = redirect_uri
+    _save_pkce_state()
 
     params = {
         "response_type": "code",
@@ -130,6 +159,7 @@ def exchange_code_for_tokens(code: str, state: str) -> dict[str, Any]:
     Returns:
         The token response dict containing access_token, refresh_token, etc.
     """
+    _load_pkce_state()
     expected_state = _pkce_state.get("state", "")
     if state != expected_state:
         raise RuntimeError("OAuth state mismatch — possible CSRF attack.")
@@ -173,7 +203,7 @@ def exchange_code_for_tokens(code: str, state: str) -> dict[str, Any]:
     }
 
     _save_tokens(tokens)
-    _pkce_state.clear()
+    _clear_pkce_state()
 
     logger.info("Salesforce OAuth tokens obtained and stored successfully.")
     print("[SF OAUTH] Tokens obtained and stored successfully!")

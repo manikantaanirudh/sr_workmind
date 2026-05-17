@@ -31,6 +31,14 @@ async function proxy(request: NextRequest, pathSegments: string[]) {
 
   try {
     const upstream = await fetch(target, init);
+
+    if (upstream.status >= 300 && upstream.status < 400) {
+      const location = upstream.headers.get("location");
+      if (location) {
+        return NextResponse.redirect(location, upstream.status);
+      }
+    }
+
     const responseHeaders = new Headers(upstream.headers);
 
     return new NextResponse(upstream.body, {
