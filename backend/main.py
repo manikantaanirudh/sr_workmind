@@ -26,6 +26,7 @@ from backend.mcp.salesforce_oauth import (
 from backend.model.docusign_tool_planner import plan_docusign_operation
 from backend.model.sql_generator import generate_sql
 from backend.model.salesforce_sql_generator import generate_soql
+from backend.json_utils import json_safe_rows
 from backend.response.formatter import build_user_message
 from backend.schemas import (
     ExecuteRequest,
@@ -45,12 +46,49 @@ app.add_middleware(
 )
 
 
+def _oauth_redirect_base(request: Request) -> str:
+    """Base URL for OAuth callbacks (must match Connected App / DocuSign redirect URIs)."""
+    for candidate in (
+        settings.oauth_redirect_base_url.strip(),
+        settings.public_backend_url.strip(),
+    ):
+        if candidate:
+            return candidate.rstrip("/")
+    return str(request.base_url).rstrip("/")
+
+
 def _external_base_url(request: Request) -> str:
     """Return the public backend URL when configured, otherwise the request origin."""
-    base_url = settings.public_backend_url.strip().rstrip("/")
-    if base_url:
-        return base_url
-    return str(request.base_url).rstrip("/")
+    return _oauth_redirect_base(request)
+
+
+@app.get("/config/oauth")
+def oauth_config(request: Request) -> dict[str, str | list[str]]:
+    """Return exact OAuth redirect URIs to register in Salesforce and DocuSign."""
+    base = _oauth_redirect_base(request)
+    return {
+        "backend_base_url": base,
+        "salesforce_auth_url": f"{base}/auth/salesforce",
+        "salesforce_callback_url": f"{base}/oauth/salesforce/callback",
+        "docusign_auth_url": f"{base}/auth/docusign",
+        "docusign_callback_url": f"{base}/oauth/docusign/callback",
+        "register_in_salesforce": (
+            "Salesforce Setup → App Manager → Connected App → "
+            "Callback URL must include the salesforce_callback_url exactly."
+        ),
+        "register_in_docusign": (
+            "DocuSign Admin → Apps and Keys → your app → "
+            "Redirect URI must include the docusign_callback_url exactly."
+        ),
+        "local_dev_callbacks": [
+            "http://127.0.0.1:8000/oauth/salesforce/callback",
+            "http://127.0.0.1:8000/oauth/docusign/callback",
+        ],
+        "render_callbacks": [
+            "https://sr-workmind-backend.onrender.com/oauth/salesforce/callback",
+            "https://sr-workmind-backend.onrender.com/oauth/docusign/callback",
+        ],
+    }
 
 
 @app.get("/health")
@@ -272,16 +310,21 @@ def _execute_snowflake(prompt: str, intent_payload: dict, started: float) -> Exe
 
     # --- Step 6: Execute SQL through Snowflake MCP Server ---
     columns, rows = route_and_execute(intent_payload["platform"], sql)
-    message = build_user_message(intent_payload["intent"], rows)
+    safe_rows = json_safe_rows(rows)
+    message = build_user_message(intent_payload["intent"], safe_rows)
     elapsed = round(time.perf_counter() - started, 2)
 
     return ExecuteResponse(
         intent=IntentPayload(**intent_payload),
         sql=sql,
-        result=QueryResultPayload(columns=columns, rows=rows),
+        result=QueryResultPayload(columns=columns, rows=safe_rows),
         message=message,
         model=selected_model,
-        connector="Snowflake MCP Server (Standardized)",
+        connector=(
+            "Snowflake SQL API (PAT)"
+            if settings.snowflake_use_sql_api and settings.snowflake_pat.strip()
+            else "Snowflake MCP Server (Standardized)"
+        ),
         mcp_validation=mcp_status,
         execution_time_sec=elapsed,
         security_checks=["MCP Server RBAC", "OAuth/PAT Auth", "Audit Logged"],
@@ -332,14 +375,15 @@ def _execute_salesforce(prompt: str, intent_payload: dict, started: float) -> Ex
         soql_or_operation=soql_or_op,
         sf_params=sf_params,
     )
+    safe_rows = json_safe_rows(rows)
 
-    message = build_user_message(intent_payload["intent"], rows)
+    message = build_user_message(intent_payload["intent"], safe_rows)
     elapsed = round(time.perf_counter() - started, 2)
 
     return ExecuteResponse(
         intent=IntentPayload(**intent_payload),
         sql=soql_or_op,
-        result=QueryResultPayload(columns=columns, rows=rows),
+        result=QueryResultPayload(columns=columns, rows=safe_rows),
         message=message,
         model=selected_model,
         connector="Salesforce Hosted MCP Server",
@@ -372,13 +416,14 @@ def _execute_docusign(prompt: str, intent_payload: dict, started: float) -> Exec
 
     ds_governance_log(prompt, operation.tool_name, operation.arguments)
     columns, rows = ds_route_and_execute(operation)
-    message = build_user_message(intent_payload["intent"], rows)
+    safe_rows = json_safe_rows(rows)
+    message = build_user_message(intent_payload["intent"], safe_rows)
     elapsed = round(time.perf_counter() - started, 2)
 
     return ExecuteResponse(
         intent=IntentPayload(**intent_payload),
         sql=operation.display,
-        result=QueryResultPayload(columns=columns, rows=rows),
+        result=QueryResultPayload(columns=columns, rows=safe_rows),
         message=message,
         model=selected_model,
         connector="Docusign Managed MCP Server (Beta)",

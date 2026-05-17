@@ -41,6 +41,13 @@ services:
           name: sr-workmind-backend
           type: web
           envVarKey: RENDER_EXTERNAL_URL
+      - key: OAUTH_REDIRECT_BASE_URL
+        fromService:
+          name: sr-workmind-backend
+          type: web
+          envVarKey: RENDER_EXTERNAL_URL
+      - key: SNOWFLAKE_USE_SQL_API
+        value: "true"
       - key: FRONTEND_ORIGIN
         fromService:
           name: sr-workmind-frontend

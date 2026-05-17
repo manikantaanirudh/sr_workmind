@@ -113,11 +113,11 @@ def _execute_sql_via_sql_api(sql: str) -> tuple[list[str], list[list[Any]]]:
         "database": settings.snowflake_database.strip().upper(),
         "schema": settings.snowflake_schema.strip().upper(),
     }
-    warehouse = settings.snowflake_warehouse.strip().upper()
-    if warehouse:
-        body["warehouse"] = warehouse
+    warehouse = settings.snowflake_warehouse.strip().upper() or "COMPUTE_WH"
+    body["warehouse"] = warehouse
     role = settings.snowflake_role.strip()
-    if role:
+    # PAT users often cannot assume ACCOUNTADMIN; omit role unless explicitly configured.
+    if role and role.upper() != "ACCOUNTADMIN":
         body["role"] = role
 
     headers = _auth_headers()
@@ -126,9 +126,13 @@ def _execute_sql_via_sql_api(sql: str) -> tuple[list[str], list[list[Any]]]:
     with httpx.Client(timeout=120.0, follow_redirects=True) as client:
         response = client.post(_sql_api_url(), headers=headers, json=body)
 
-        if response.status_code == 422:
-            payload = response.json()
-            raise RuntimeError(payload.get("message", response.text))
+        if response.status_code in {400, 422}:
+            try:
+                payload = response.json()
+                message = payload.get("message", response.text)
+            except Exception:
+                message = response.text
+            raise RuntimeError(f"Snowflake SQL API error ({response.status_code}): {message}")
 
         if response.status_code == 202:
             payload = response.json()
@@ -140,7 +144,9 @@ def _execute_sql_via_sql_api(sql: str) -> tuple[list[str], list[list[Any]]]:
             payload = _poll_sql_api_statement(client, status_path)
 
         elif response.status_code != 200:
-            response.raise_for_status()
+            raise RuntimeError(
+                f"Snowflake SQL API error ({response.status_code}): {response.text[:500]}"
+            )
         else:
             payload = response.json()
 
@@ -302,10 +308,7 @@ def mcp_tools_call(tool_name: str, arguments: dict[str, Any]) -> dict:
 # ---------------------------------------------------------------------------
 
 def execute_sql_via_mcp(sql: str) -> tuple[list[str], list[list[Any]]]:
-    """Execute a SQL statement through the Snowflake MCP Server.
-
-    This is the main entry point that replaces the old
-    ``snowflake_connector.execute_snowflake_query()`` function.
+    """Execute SQL via Snowflake (SQL API preferred, MCP as fallback).
 
     Args:
         sql: The SQL statement to execute.
@@ -313,13 +316,18 @@ def execute_sql_via_mcp(sql: str) -> tuple[list[str], list[list[Any]]]:
     Returns:
         A tuple of ``(columns, rows)`` matching the existing frontend contract.
     """
-    tool_name = settings.mcp_tool_name.strip()
-    
-    # Strip trailing semicolons as the MCP server's internal parser sometimes chokes on them
     clean_sql = sql.strip()
     if clean_sql.endswith(";"):
         clean_sql = clean_sql[:-1]
-        
+
+    if settings.snowflake_use_sql_api and settings.snowflake_pat.strip():
+        try:
+            return _execute_sql_via_sql_api(clean_sql)
+        except Exception as api_exc:
+            logger.warning("Snowflake SQL API failed, trying MCP: %s", api_exc)
+
+    tool_name = settings.mcp_tool_name.strip()
+
     arguments = _build_sql_tool_arguments(clean_sql)
     logger.info("MCP tools/call arguments keys: %s", list(arguments.keys()))
 
@@ -398,16 +406,19 @@ def _execute_fallback_sql(sql: str) -> tuple[list[str], list[list[Any]]]:
         )
 
     print("[MCP FALLBACK] Executing SQL directly via python connector...")
+    connect_kwargs: dict[str, Any] = {
+        "user": user,
+        "password": password,
+        "account": account,
+        "database": settings.snowflake_database,
+        "schema": settings.snowflake_schema,
+        "warehouse": settings.snowflake_warehouse or "COMPUTE_WH",
+    }
+    role = settings.snowflake_role.strip()
+    if role and role.upper() != "ACCOUNTADMIN":
+        connect_kwargs["role"] = role
     try:
-        with snowflake.connector.connect(
-            user=user,
-            password=password,
-            account=account,
-            database=settings.snowflake_database,
-            schema=settings.snowflake_schema,
-            warehouse=settings.snowflake_warehouse or "COMPUTE_WH",
-            role=settings.snowflake_role or "ACCOUNTADMIN"
-        ) as conn:
+        with snowflake.connector.connect(**connect_kwargs) as conn:
             with conn.cursor() as cur:
                 cur.execute(sql)
                 

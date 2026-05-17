@@ -15,7 +15,15 @@ class Settings:
     app_port: int = int(os.getenv("APP_PORT", "8000"))
     frontend_origin: str = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
     public_backend_url: str = os.getenv("PUBLIC_BACKEND_URL", "")
+    oauth_redirect_base_url: str = os.getenv("OAUTH_REDIRECT_BASE_URL", "")
     token_storage_dir: str = os.getenv("TOKEN_STORAGE_DIR", str(backend_dir / "logs"))
+    # Prefer Snowflake SQL API (PAT) over MCP tools/call when true (default on).
+    snowflake_use_sql_api: bool = os.getenv("SNOWFLAKE_USE_SQL_API", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
     llm_provider: str = os.getenv("LLM_PROVIDER", "ollama")
     ollama_model: str = os.getenv("OLLAMA_MODEL", "llama3.1:8b")

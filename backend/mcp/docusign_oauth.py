@@ -24,7 +24,35 @@ from backend.config import settings
 logger = logging.getLogger(__name__)
 
 _TOKEN_FILE = Path(settings.token_storage_dir) / "docusign_tokens.json"
+_OAUTH_STATE_FILE = Path(settings.token_storage_dir) / "docusign_oauth_state.json"
 _oauth_state: dict[str, str] = {}
+
+
+def _save_oauth_state() -> None:
+    _OAUTH_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _OAUTH_STATE_FILE.write_text(json.dumps(_oauth_state), encoding="utf-8")
+
+
+def _load_oauth_state() -> None:
+    global _oauth_state
+    if not _OAUTH_STATE_FILE.exists():
+        return
+    try:
+        loaded = json.loads(_OAUTH_STATE_FILE.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            _oauth_state = {str(k): str(v) for k, v in loaded.items()}
+    except (json.JSONDecodeError, OSError):
+        _oauth_state = {}
+
+
+def _clear_oauth_state() -> None:
+    global _oauth_state
+    _oauth_state = {}
+    if _OAUTH_STATE_FILE.exists():
+        try:
+            _OAUTH_STATE_FILE.unlink()
+        except OSError:
+            pass
 
 
 def _load_tokens() -> dict[str, Any]:
@@ -61,6 +89,7 @@ def get_docusign_auth_url(redirect_uri: str) -> str:
     state = secrets.token_urlsafe(32)
     _oauth_state["state"] = state
     _oauth_state["redirect_uri"] = redirect_uri
+    _save_oauth_state()
 
     params = {
         "response_type": "code",
@@ -76,6 +105,7 @@ def get_docusign_auth_url(redirect_uri: str) -> str:
 
 def exchange_code_for_tokens(code: str, state: str) -> dict[str, Any]:
     """Exchange an authorization code for access and refresh tokens."""
+    _load_oauth_state()
     expected_state = _oauth_state.get("state", "")
     if state != expected_state:
         raise RuntimeError("OAuth state mismatch; possible CSRF attempt.")
@@ -119,7 +149,7 @@ def exchange_code_for_tokens(code: str, state: str) -> dict[str, Any]:
         "obtained_at": time.time(),
     }
     _save_tokens(tokens)
-    _oauth_state.clear()
+    _clear_oauth_state()
     logger.info("Docusign OAuth tokens obtained and stored.")
     return tokens
 

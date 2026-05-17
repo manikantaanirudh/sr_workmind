@@ -70,8 +70,26 @@ type ThinkingStep = {
   status: "pending" | "running" | "done";
 };
 
+async function readResponseText(response: Response): Promise<string> {
+  return response.text();
+}
+
+async function parseJsonResponse<T>(response: Response): Promise<T> {
+  const text = await readResponseText(response);
+  if (!text) {
+    throw new Error(`Empty response (${response.status})`);
+  }
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new Error(
+      text.length > 400 ? `${text.slice(0, 400)}…` : text,
+    );
+  }
+}
+
 async function readApiError(response: Response): Promise<string> {
-  const errorText = await response.text();
+  const errorText = await readResponseText(response);
   if (!errorText) {
     return `Request failed (${response.status})`;
   }
@@ -98,6 +116,11 @@ async function readApiError(response: Response): Promise<string> {
     return errorText;
   }
 }
+
+type OAuthConfig = {
+  salesforce_callback_url: string;
+  docusign_callback_url: string;
+};
 
 const platforms: { id: PlatformId; label: string; badge: string }[] = [
   { id: "snowflake", label: "Snowflake", badge: "SF" },
@@ -339,6 +362,9 @@ export default function Home() {
   const [generatedSql, setGeneratedSql] = useState("");
   const [sfAuthenticated, setSfAuthenticated] = useState(false);
   const [dsAuthenticated, setDsAuthenticated] = useState(false);
+  const [oauthCallbacks, setOauthCallbacks] = useState<OAuthConfig | null>(
+    null,
+  );
 
   const apiBase = "/api";
   const backendPublicUrl = (
@@ -351,6 +377,21 @@ export default function Home() {
     ? `${backendPublicUrl}/auth/docusign`
     : `${apiBase}/auth/docusign`;
   const promptSuggestions = suggestionsFor(activePlatform);
+
+  useEffect(() => {
+    const loadOAuthConfig = async () => {
+      try {
+        const res = await fetch(`${apiBase}/config/oauth`);
+        if (res.ok) {
+          const data = await parseJsonResponse<OAuthConfig>(res);
+          setOauthCallbacks(data);
+        }
+      } catch {
+        /* ignore */
+      }
+    };
+    void loadOAuthConfig();
+  }, [apiBase]);
 
   // Check external connector auth status on mount
   useEffect(() => {
@@ -405,7 +446,7 @@ export default function Home() {
         throw new Error(await readApiError(response));
       }
 
-      const payload = (await response.json()) as ExecuteApiResponse;
+      const payload = await parseJsonResponse<ExecuteApiResponse>(response);
       const platformId = payload.intent.platform.toLowerCase() as PlatformId;
       const knownPlatform = platforms.some((p) => p.id === platformId)
         ? platformId
@@ -942,8 +983,14 @@ export default function Home() {
                     </p>
                     <p className="mt-1 text-xs text-amber-700">
                       You must connect your Salesforce org via OAuth 2.0 before
-                      executing commands.
+                      executing commands. In your Salesforce Connected App,
+                      add this callback URL exactly:
                     </p>
+                    {oauthCallbacks?.salesforce_callback_url ? (
+                      <p className="mt-2 break-all rounded bg-amber-100/80 px-2 py-1 font-mono text-[10px] text-amber-900">
+                        {oauthCallbacks.salesforce_callback_url}
+                      </p>
+                    ) : null}
                     <a
                       href={salesforceAuthUrl}
                       target="_blank"
@@ -962,7 +1009,13 @@ export default function Home() {
                     </p>
                     <p className="mt-1 text-xs text-amber-700">
                       Connect Docusign via OAuth 2.0 before running MCP tools.
+                      In DocuSign Apps and Keys, add this redirect URI exactly:
                     </p>
+                    {oauthCallbacks?.docusign_callback_url ? (
+                      <p className="mt-2 break-all rounded bg-amber-100/80 px-2 py-1 font-mono text-[10px] text-amber-900">
+                        {oauthCallbacks.docusign_callback_url}
+                      </p>
+                    ) : null}
                     <a
                       href={docusignAuthUrl}
                       target="_blank"
