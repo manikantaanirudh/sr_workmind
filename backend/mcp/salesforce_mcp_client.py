@@ -19,7 +19,6 @@ import json
 import logging
 import time
 from typing import Any
-
 import httpx
 
 from backend.config import settings
@@ -35,6 +34,47 @@ logger = logging.getLogger(__name__)
 
 _sf_session_id: str | None = None
 _sf_http_client: httpx.Client | None = None
+_last_sf_execution_mode: str = "mcp"
+
+
+def probe_salesforce_connectivity() -> dict[str, Any]:
+    """Lightweight Salesforce probe for /health/diagnostics (no secrets)."""
+    from backend.mcp.salesforce_oauth import auth_status, get_instance_url, is_authenticated
+
+    out: dict[str, Any] = {
+        "rest_soql_first": settings.salesforce_rest_soql_first,
+        "rest_soql_fallback": settings.salesforce_rest_soql_fallback,
+        "mcp_soql_timeout_sec": settings.salesforce_mcp_soql_timeout_sec,
+        "soql_row_limit": settings.salesforce_soql_row_limit,
+        "mcp_server_url": settings.salesforce_mcp_server_url.strip(),
+    }
+    if not is_authenticated():
+        out["rest_query"] = "skipped (not authenticated)"
+        return out
+    out["oauth"] = auth_status()
+    try:
+        instance = get_instance_url()
+        out["instance_url"] = instance
+    except RuntimeError:
+        out["instance_url"] = None
+    try:
+        cols, rows = execute_soql_via_rest("SELECT Id FROM Account LIMIT 1")
+        out["rest_query"] = f"ok ({len(rows)} row(s), {len(cols)} col(s))"
+    except Exception as exc:
+        out["rest_query"] = f"error: {exc}"
+    return out
+
+
+def get_salesforce_connector_label() -> str:
+    """Human-readable connector label for the last Salesforce query execution."""
+    if _last_sf_execution_mode == "rest":
+        return "Salesforce REST API (same OAuth as Hosted MCP)"
+    if _last_sf_execution_mode == "rest_fallback":
+        return (
+            "Salesforce Hosted MCP Server "
+            "(soqlQuery slow - results via REST Query API, same OAuth)"
+        )
+    return "Salesforce Hosted MCP Server (platform/sobject-all)"
 
 
 def _sf_timeout() -> httpx.Timeout:
@@ -302,15 +342,93 @@ def sf_mcp_tools_call(tool_name: str, arguments: dict[str, Any]) -> dict:
 # Public API — High-level operations
 # ---------------------------------------------------------------------------
 
-def execute_soql_via_mcp(soql: str) -> tuple[list[str], list[list[Any]]]:
-    """Execute SOQL via Salesforce hosted MCP server (soqlQuery tool)."""
+def _records_to_table(records: list[dict[str, Any]]) -> tuple[list[str], list[list[Any]]]:
+    """Convert Salesforce REST/MCP record dicts to (columns, rows)."""
+    if not records:
+        return ["status"], [["Query returned 0 records."]]
+    skip_keys = {"attributes"}
+    columns = [k for k in records[0].keys() if k not in skip_keys]
+    rows: list[list[Any]] = []
+    for record in records:
+        row: list[Any] = []
+        for col in columns:
+            val = record.get(col)
+            if isinstance(val, dict):
+                val = val.get("Name", str(val))
+            row.append(val)
+        rows.append(row)
+    return columns, rows
+
+
+def execute_soql_via_rest(soql: str) -> tuple[list[str], list[list[Any]]]:
+    """Execute SOQL via Salesforce REST Query API (fast; same OAuth token as MCP)."""
+    from backend.mcp.salesforce_oauth import get_instance_url, get_valid_access_token
+
     clean_soql = soql.strip().rstrip(";")
-    # platform/sobject-all always exposes soqlQuery — skip slow tools/list on Render.
+    access_token = get_valid_access_token()
+    instance = get_instance_url().rstrip("/")
+    api_version = settings.salesforce_api_version.strip().lstrip("v") or "59.0"
+    url = f"{instance}/services/data/v{api_version}/query"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+    }
+    logger.info("Salesforce REST query -> %s", url)
+
+    with httpx.Client(timeout=httpx.Timeout(60.0), verify=False) as client:
+        response = client.get(url, headers=headers, params={"q": clean_soql})
+
+    if response.status_code == 401:
+        raise RuntimeError(
+            "Salesforce REST API authentication failed (401). Reconnect at /auth/salesforce."
+        )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Salesforce REST query failed ({response.status_code}): {response.text[:500]}"
+        )
+
+    data = response.json()
+    records = data.get("records", [])
+    return _records_to_table(records)
+
+
+def _execute_soql_via_mcp_tool(soql: str, read_timeout: float) -> tuple[list[str], list[list[Any]]]:
+    """Run soqlQuery on hosted MCP with a bounded read timeout."""
+    clean_soql = soql.strip().rstrip(";")
     tool_name = "soqlQuery"
     arguments = {"query": clean_soql}
-    logger.info("Salesforce MCP tools/call -> %s", tool_name)
-    result = sf_mcp_tools_call(tool_name, arguments)
+    logger.info("Salesforce MCP tools/call -> %s (timeout=%ss)", tool_name, read_timeout)
+    payload = _sf_jsonrpc_request(
+        "tools/call",
+        params={"name": tool_name, "arguments": arguments},
+    )
+    result = _sf_send_rpc(payload, timeout=read_timeout)
     return _parse_sf_tool_result(result)
+
+
+def execute_soql_via_mcp(soql: str) -> tuple[list[str], list[list[Any]]]:
+    """Execute SOQL: prefer MCP soqlQuery; use REST Query API when MCP is slow (Render)."""
+    global _last_sf_execution_mode
+    clean_soql = soql.strip().rstrip(";")
+    mcp_timeout = float(settings.salesforce_mcp_soql_timeout_sec)
+
+    if settings.salesforce_rest_soql_first:
+        logger.info("Salesforce SOQL via REST (production-fast path)")
+        _last_sf_execution_mode = "rest"
+        return execute_soql_via_rest(clean_soql)
+
+    try:
+        _last_sf_execution_mode = "mcp"
+        return _execute_soql_via_mcp_tool(clean_soql, mcp_timeout)
+    except (RuntimeError, httpx.ReadTimeout, httpx.TimeoutException) as exc:
+        err = str(exc).lower()
+        if settings.salesforce_rest_soql_fallback and (
+            "timed out" in err or "timeout" in err
+        ):
+            logger.warning("Salesforce MCP soqlQuery failed (%s); using REST query API.", exc)
+            _last_sf_execution_mode = "rest_fallback"
+            return execute_soql_via_rest(clean_soql)
+        raise
 
 
 def execute_sf_search(search_query: str) -> tuple[list[str], list[list[Any]]]:
@@ -494,23 +612,7 @@ def _try_parse_sf_result(text: str) -> tuple[list[str], list[list[Any]]] | None:
 
     # Handle SOQL result format: {"totalSize": N, "records": [...]}
     if isinstance(data, dict) and "records" in data:
-        records = data["records"]
-        if not records:
-            return ["status"], [["Query returned 0 records."]]
-        # Filter out Salesforce metadata keys
-        skip_keys = {"attributes"}
-        columns = [k for k in records[0].keys() if k not in skip_keys]
-        rows = []
-        for record in records:
-            row = []
-            for col in columns:
-                val = record.get(col)
-                # Handle nested relationship objects
-                if isinstance(val, dict):
-                    val = val.get("Name", str(val))
-                row.append(val)
-            rows.append(row)
-        return columns, rows
+        return _records_to_table(data["records"])
 
     # Handle array of objects: [{...}, {...}]
     if isinstance(data, list) and data and isinstance(data[0], dict):

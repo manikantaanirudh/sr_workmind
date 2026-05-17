@@ -22,6 +22,7 @@ from backend.mcp.docusign_oauth import (
     is_authenticated as ds_is_authenticated,
 )
 from backend.mcp.salesforce_executor import sf_governance_log, sf_route_and_execute, sf_validate_via_mcp
+from backend.mcp.salesforce_mcp_client import get_salesforce_connector_label, probe_salesforce_connectivity
 from backend.mcp.salesforce_oauth import (
     exchange_code_for_tokens,
     get_salesforce_auth_url,
@@ -114,6 +115,7 @@ def health_diagnostics() -> dict:
         "frontend_origin": settings.frontend_origin,
         "public_backend_url": settings.public_backend_url,
         "snowflake": probe_snowflake_connectivity(),
+        "salesforce": probe_salesforce_connectivity(),
         "salesforce_authenticated": sf_is_authenticated(),
         "docusign_authenticated": ds_is_authenticated(),
         "token_storage_dir": settings.token_storage_dir,
@@ -382,14 +384,8 @@ def _execute_salesforce(prompt: str, intent_payload: dict, started: float) -> Ex
     action = intent_payload.get("action", "query")
     params = intent_payload.get("parameters", {})
 
-    # --- Step 2: Validate Salesforce MCP (OAuth) + warm MCP session ---
+    # --- Step 2: Validate Salesforce OAuth (skip blocking MCP warm-up on Render) ---
     mcp_status = sf_validate_via_mcp()
-    try:
-        from backend.mcp.salesforce_mcp_client import warm_sf_mcp_session
-
-        warm_sf_mcp_session()
-    except Exception as exc:
-        logger.warning("Salesforce MCP session warm-up skipped: %s", exc)
 
     # --- Step 3: Generate SOQL or operation descriptor via LLM ---
     soql_or_op, selected_model = generate_soql(
@@ -434,7 +430,7 @@ def _execute_salesforce(prompt: str, intent_payload: dict, started: float) -> Ex
         result=QueryResultPayload(columns=columns, rows=safe_rows),
         message=message,
         model=selected_model,
-        connector="Salesforce Hosted MCP Server (platform/sobject-all)",
+        connector=get_salesforce_connector_label(),
         mcp_validation=mcp_status,
         execution_time_sec=elapsed,
         security_checks=["MCP Server RBAC", "OAuth 2.0 PKCE", "Audit Logged"],
