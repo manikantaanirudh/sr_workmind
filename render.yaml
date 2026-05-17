@@ -81,7 +81,6 @@ services:
         sync: false
       - key: SALESFORCE_INSTANCE_URL
         sync: false
-        sync: false
       - key: SALESFORCE_CONSUMER_KEY
         sync: false
       - key: DOCUSIGN_CLIENT_ID
