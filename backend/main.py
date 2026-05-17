@@ -320,11 +320,7 @@ def _execute_snowflake(prompt: str, intent_payload: dict, started: float) -> Exe
         result=QueryResultPayload(columns=columns, rows=safe_rows),
         message=message,
         model=selected_model,
-        connector=(
-            "Snowflake SQL API (PAT)"
-            if settings.snowflake_use_sql_api and settings.snowflake_pat.strip()
-            else "Snowflake MCP Server (Standardized)"
-        ),
+        connector="Snowflake Managed MCP Server",
         mcp_validation=mcp_status,
         execution_time_sec=elapsed,
         security_checks=["MCP Server RBAC", "OAuth/PAT Auth", "Audit Logged"],
@@ -386,7 +382,7 @@ def _execute_salesforce(prompt: str, intent_payload: dict, started: float) -> Ex
         result=QueryResultPayload(columns=columns, rows=safe_rows),
         message=message,
         model=selected_model,
-        connector="Salesforce REST API (SOQL)",
+        connector="Salesforce Hosted MCP Server (platform/sobject-all)",
         mcp_validation=mcp_status,
         execution_time_sec=elapsed,
         security_checks=["MCP Server RBAC", "OAuth 2.0 PKCE", "Audit Logged"],

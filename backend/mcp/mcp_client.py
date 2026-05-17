@@ -240,28 +240,29 @@ def mcp_tools_list() -> list[dict]:
     return tools
 
 
-_sql_tool_schema_cache: dict[str, Any] | None = None
+_sql_tool_schema_cache: dict[str, dict[str, Any]] = {}
 
 
-def _get_sql_tool_schema() -> dict[str, Any]:
-    """Return the input schema for the configured SQL MCP tool (cached)."""
-    global _sql_tool_schema_cache
-    if _sql_tool_schema_cache is not None:
-        return _sql_tool_schema_cache
+def _get_sql_tool_schema(tool_name: str) -> dict[str, Any]:
+    """Return the input schema for a Snowflake MCP tool (cached per tool name)."""
+    if tool_name in _sql_tool_schema_cache:
+        return _sql_tool_schema_cache[tool_name]
 
-    expected_tool = settings.mcp_tool_name.strip()
     for tool in mcp_tools_list():
-        if tool.get("name") == expected_tool:
-            _sql_tool_schema_cache = tool
+        if tool.get("name") == tool_name:
+            _sql_tool_schema_cache[tool_name] = tool
             return tool
 
-    _sql_tool_schema_cache = {}
-    return _sql_tool_schema_cache
+    _sql_tool_schema_cache[tool_name] = {}
+    return _sql_tool_schema_cache[tool_name]
 
 
-def _build_sql_tool_arguments(clean_sql: str) -> dict[str, Any]:
+def _build_sql_tool_arguments(clean_sql: str, tool_name: str | None = None) -> dict[str, Any]:
     """Build tools/call arguments using the MCP tool's declared input schema."""
-    tool = _get_sql_tool_schema()
+    from backend.mcp.tool_registry import resolve_snowflake_sql_tool
+
+    resolved_tool = tool_name or resolve_snowflake_sql_tool()
+    tool = _get_sql_tool_schema(resolved_tool)
     schema = tool.get("inputSchema") or tool.get("input_schema") or {}
     properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
 
@@ -269,8 +270,9 @@ def _build_sql_tool_arguments(clean_sql: str) -> dict[str, Any]:
         return {"query": clean_sql}
     if "sql" in properties:
         return {"sql": clean_sql}
+    if "statement" in properties:
+        return {"statement": clean_sql}
 
-    # Snowflake SYSTEM_EXECUTE_SQL expects `query` (see Snowflake MCP docs).
     return {"query": clean_sql}
 
 
@@ -308,7 +310,9 @@ def mcp_tools_call(tool_name: str, arguments: dict[str, Any]) -> dict:
 # ---------------------------------------------------------------------------
 
 def execute_sql_via_mcp(sql: str) -> tuple[list[str], list[list[Any]]]:
-    """Execute SQL via Snowflake (SQL API preferred, MCP as fallback).
+    """Execute SQL via Snowflake's hosted MCP server (tools/call).
+
+    See: https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-agents-mcp
 
     Args:
         sql: The SQL statement to execute.
@@ -320,16 +324,11 @@ def execute_sql_via_mcp(sql: str) -> tuple[list[str], list[list[Any]]]:
     if clean_sql.endswith(";"):
         clean_sql = clean_sql[:-1]
 
-    if settings.snowflake_use_sql_api and settings.snowflake_pat.strip():
-        try:
-            return _execute_sql_via_sql_api(clean_sql)
-        except Exception as api_exc:
-            logger.warning("Snowflake SQL API failed, trying MCP: %s", api_exc)
+    from backend.mcp.tool_registry import resolve_snowflake_sql_tool
 
-    tool_name = settings.mcp_tool_name.strip()
-
-    arguments = _build_sql_tool_arguments(clean_sql)
-    logger.info("MCP tools/call arguments keys: %s", list(arguments.keys()))
+    tool_name = resolve_snowflake_sql_tool()
+    arguments = _build_sql_tool_arguments(clean_sql, tool_name=tool_name)
+    logger.info("Snowflake MCP tools/call -> %s keys=%s", tool_name, list(arguments.keys()))
 
     result = mcp_tools_call(tool_name, arguments)
 
@@ -354,19 +353,13 @@ def execute_sql_via_mcp(sql: str) -> tuple[list[str], list[list[Any]]]:
 
             if result.get("isError"):
                 error_msg = text.strip() or "Unknown MCP Server error"
-                if settings.snowflake_pat.strip():
+                if settings.snowflake_use_sql_api and settings.snowflake_pat.strip():
                     logger.warning(
-                        "MCP error (%s). Attempting Snowflake SQL API fallback.",
+                        "MCP error (%s). SNOWFLAKE_USE_SQL_API fallback enabled.",
                         error_msg,
                     )
                     return _execute_sql_via_sql_api(clean_sql)
-                if _can_use_native_fallback():
-                    logger.warning(
-                        "MCP error (%s). Attempting native Snowflake connector fallback.",
-                        error_msg,
-                    )
-                    return _execute_fallback_sql(clean_sql)
-                raise RuntimeError(f"MCP SQL execution failed: {error_msg}")
+                raise RuntimeError(f"Snowflake MCP SQL execution failed: {error_msg}")
 
             parsed = _try_parse_sql_result(text, sql)
             if parsed:

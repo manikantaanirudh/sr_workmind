@@ -8,6 +8,7 @@ Mirrors the Snowflake sql_generator.py but generates SOQL
 from __future__ import annotations
 
 from backend.config import settings
+from backend.mcp.schema_discovery import get_salesforce_schema_hint
 from backend.model.llm_clients import call_llm_for_soql
 
 
@@ -61,7 +62,7 @@ def generate_soql(prompt: str, intent: str, params: dict) -> tuple[str, str]:
     for attempt in range(3):
         llm_soql = call_llm_for_soql(
             prompt=llm_prompt,
-            object_hints=settings.salesforce_object_hints,
+            object_hints=get_salesforce_schema_hint(),
             action=action,
             sobject_name=sobject,
         )
@@ -100,7 +101,7 @@ def _generate_sf_operation(
         prompt=prompt,
         action=action,
         sobject_name=sobject,
-        object_hints=settings.salesforce_object_hints,
+        object_hints=get_salesforce_schema_hint(),
     )
 
     # Return the JSON operation as the "SQL" field for display

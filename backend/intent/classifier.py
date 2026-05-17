@@ -1,4 +1,3 @@
-import re
 from typing import Any
 
 
@@ -139,25 +138,11 @@ def _extract_create_table_name(prompt: str) -> str | None:
     return None
 
 
-def _is_netflix_dataset_prompt(prompt: str) -> bool:
-    lowered = prompt.lower()
-    if "netflix_table" in lowered or "netflix table" in lowered:
-        return True
-    if re.search(r"\bon\s+netflix\b", lowered):
-        return True
-    if re.search(r"\bnetflix\s+dataset\b", lowered):
-        return True
-    return False
-
-
 def _extract_table_hint(prompt: str, action_hint: str) -> str | None:
     if action_hint == "create":
         created = _extract_create_table_name(prompt)
         if created:
             return created
-
-    if action_hint != "create" and _is_netflix_dataset_prompt(prompt):
-        return "NETFLIX_TABLE"
 
     normalized = _normalize_prompt_text(prompt).lower()
     tokens = normalized.split()
@@ -250,47 +235,16 @@ def _extract_insert_columns_hint(prompt: str) -> list[str]:
     return columns
 
 
-def _detect_platform(prompt: str) -> str:
-    """Detect whether the prompt targets Snowflake, Salesforce, or Docusign.
-
-    Uses keyword matching to determine the target platform.
-    Explicit platform mentions take priority.
-    """
+def _detect_platform_explicit(prompt: str) -> str | None:
+    """Only match when the user explicitly names a platform."""
     text = prompt.lower()
-    words = set(text.split())
-
-    # Explicit platform mentions take highest priority
     if "docusign" in text or "docu sign" in text:
         return "docusign"
     if "salesforce" in text or "sfdc" in text:
         return "salesforce"
-    if "snowflake" in text or "netflix" in text or "netflix_table" in text:
+    if "snowflake" in text:
         return "snowflake"
-
-    ds_keywords = {
-        "agreement", "agreements", "contract", "contracts",
-        "envelope", "envelopes", "signature", "signatures",
-        "signing", "navigator", "maestro", "workflow", "workflows",
-        "counterparty", "counterparties",
-    }
-    if words & ds_keywords:
-        return "docusign"
-
-    # Salesforce CRM object keywords
-    sf_keywords = {
-        "account", "accounts", "contact", "contacts",
-        "opportunity", "opportunities", "lead", "leads",
-        "case", "cases", "task", "tasks",
-        "crm", "pipeline", "deal", "deals",
-        "prospect", "prospects", "sobject",
-    }
-
-    # Check if any Salesforce keywords appear in the prompt
-    if words & sf_keywords:
-        return "salesforce"
-
-    # Default to Snowflake
-    return "snowflake"
+    return None
 
 
 def _infer_sf_action(prompt: str) -> str:
@@ -309,29 +263,6 @@ def _infer_sf_action(prompt: str) -> str:
     return "query"
 
 
-def _extract_sf_object(prompt: str) -> str:
-    """Extract the Salesforce object type from the prompt."""
-    text = prompt.lower()
-    sf_objects = {
-        "account": "Account",
-        "accounts": "Account",
-        "contact": "Contact",
-        "contacts": "Contact",
-        "opportunity": "Opportunity",
-        "opportunities": "Opportunity",
-        "lead": "Lead",
-        "leads": "Lead",
-        "case": "Case",
-        "cases": "Case",
-        "task": "Task",
-        "tasks": "Task",
-    }
-    for keyword, obj_name in sf_objects.items():
-        if keyword in text:
-            return obj_name
-    return ""
-
-
 def _infer_ds_action(prompt: str) -> str:
     """Infer a Docusign MCP action family from a natural-language prompt."""
     text = prompt.lower()
@@ -344,57 +275,99 @@ def _infer_ds_action(prompt: str) -> str:
     return "query_agreements"
 
 
-def classify_intent(prompt: str) -> dict[str, Any]:
-    # Detect platform
-    platform = _detect_platform(prompt)
-
-    # --- Docusign path ---
+def _intent_label(platform: str, action: str) -> str:
     if platform == "docusign":
-        action = _infer_ds_action(prompt)
-        intent = "ds_query_agreements"
         if action == "agreement_details":
-            intent = "ds_agreement_details"
-        elif action == "workflow_requirements":
-            intent = "ds_workflow_requirements"
-        elif action == "trigger_workflow":
-            intent = "ds_trigger_workflow"
+            return "ds_agreement_details"
+        if action == "workflow_requirements":
+            return "ds_workflow_requirements"
+        if action == "trigger_workflow":
+            return "ds_trigger_workflow"
+        return "ds_query_agreements"
+    if platform == "salesforce":
+        mapping = {
+            "create": "sf_record_created",
+            "update": "sf_record_updated",
+            "delete": "sf_record_deleted",
+            "search": "sf_search",
+            "schema": "sf_schema",
+        }
+        return mapping.get(action, "sf_query")
+    mapping = {
+        "create": "create_table",
+        "insert": "insert_rows",
+        "update": "update_rows",
+        "delete": "delete_rows",
+    }
+    return mapping.get(action, "nl_request")
 
+
+def _build_intent_payload(
+    platform: str,
+    action: str,
+    prompt: str,
+    *,
+    sobject_name: str = "",
+    expected_table: str = "",
+) -> dict[str, Any]:
+    action_hint = action if action in {"create", "insert", "update", "delete", "query", "search", "schema", "auto"} else "auto"
+
+    if platform == "docusign":
+        ds_action = action if action in {"trigger_workflow", "workflow_requirements", "agreement_details", "query_agreements"} else _infer_ds_action(prompt)
         return {
             "platform": "docusign",
-            "action": action,
-            "intent": intent,
-            "parameters": {"action_hint": action},
+            "action": ds_action,
+            "intent": _intent_label("docusign", ds_action),
+            "parameters": {"action_hint": ds_action},
         }
 
-    # --- Salesforce path ---
     if platform == "salesforce":
-        action = _infer_sf_action(prompt)
-        sf_object = _extract_sf_object(prompt)
-
-        intent = "sf_query"
-        if action == "create":
-            intent = "sf_record_created"
-        elif action == "update":
-            intent = "sf_record_updated"
-        elif action == "delete":
-            intent = "sf_record_deleted"
-        elif action == "search":
-            intent = "sf_search"
-        elif action == "schema":
-            intent = "sf_schema"
-
-        params: dict[str, Any] = {"action_hint": action}
-        if sf_object:
-            params["sobject_name"] = sf_object
-
+        sf_action = action_hint if action_hint != "auto" else _infer_sf_action(prompt)
+        params: dict[str, Any] = {"action_hint": sf_action}
+        if sobject_name:
+            params["sobject_name"] = sobject_name
         return {
             "platform": "salesforce",
-            "action": action,
-            "intent": intent,
+            "action": sf_action,
+            "intent": _intent_label("salesforce", sf_action),
             "parameters": params,
         }
 
-    # --- Snowflake path (existing logic, completely unchanged) ---
+    # Snowflake
+    if action_hint == "auto":
+        action_hint = _infer_action_hint(prompt)
+    intent = _intent_label("snowflake", action_hint)
+    if action_hint == "query" and _is_summary_prompt(prompt):
+        intent = "summarize_table"
+
+    params_sf: dict[str, Any] = {"action_hint": action_hint}
+    table_hint = expected_table.strip() or (_extract_table_hint(prompt, action_hint) or "")
+    if table_hint:
+        params_sf["expected_table"] = table_hint
+    if action_hint == "insert":
+        insert_cols = _extract_insert_columns_hint(prompt)
+        if insert_cols:
+            params_sf["insert_columns_hint"] = insert_cols
+
+    return {
+        "platform": "snowflake",
+        "action": action_hint,
+        "intent": intent,
+        "parameters": params_sf,
+    }
+
+
+def _classify_intent_heuristic(prompt: str) -> dict[str, Any]:
+    platform = _detect_platform_explicit(prompt) or "snowflake"
+    action = _infer_action_hint(prompt)
+    if platform == "salesforce":
+        action = _infer_sf_action(prompt)
+    elif platform == "docusign":
+        action = _infer_ds_action(prompt)
+    return _build_intent_payload(platform, action, prompt)
+
+
+def classify_intent(prompt: str) -> dict[str, Any]:
     raw_sql = _extract_raw_sql(prompt)
     if raw_sql:
         first_word = raw_sql.strip().split(None, 1)[0].lower()
@@ -419,33 +392,21 @@ def classify_intent(prompt: str) -> dict[str, Any]:
             "parameters": {"raw_sql": raw_sql},
         }
 
-    action_hint = _infer_action_hint(prompt)
-    intent = "nl_request"
-    is_summary = _is_summary_prompt(prompt)
-    if action_hint == "create":
-        intent = "create_table"
-    elif action_hint == "insert":
-        intent = "insert_rows"
-    elif action_hint == "update":
-        intent = "update_rows"
-    elif action_hint == "delete":
-        intent = "delete_rows"
-    elif action_hint == "query" and is_summary:
-        intent = "summarize_table"
+    try:
+        from backend.model.llm_clients import call_llm_classify_intent
 
-    params_sf: dict[str, Any] = {"action_hint": action_hint}
-    table_hint = _extract_table_hint(prompt, action_hint)
-    if table_hint:
-        params_sf["expected_table"] = table_hint
-    if action_hint == "insert":
-        insert_cols = _extract_insert_columns_hint(prompt)
-        if insert_cols:
-            params_sf["insert_columns_hint"] = insert_cols
-
-    return {
-        "platform": "snowflake",
-        "action": action_hint,
-        "intent": intent,
-        "parameters": params_sf,
-    }
+        llm = call_llm_classify_intent(prompt)
+        platform = str(llm.get("platform", "snowflake")).lower()
+        if platform not in {"snowflake", "salesforce", "docusign"}:
+            platform = "snowflake"
+        action = str(llm.get("action", "auto")).lower()
+        return _build_intent_payload(
+            platform,
+            action,
+            prompt,
+            sobject_name=str(llm.get("sobject_name", "") or ""),
+            expected_table=str(llm.get("expected_table", "") or ""),
+        )
+    except Exception:
+        return _classify_intent_heuristic(prompt)
 

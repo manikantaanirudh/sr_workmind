@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import re
-
 from backend.config import settings
+from backend.mcp.schema_discovery import get_snowflake_schema_hint
 from backend.model.llm_clients import call_llm_for_sql
 
 
@@ -53,28 +52,6 @@ def _quote_reserved_projection_identifiers(sql: str) -> str:
     return f"SELECT {', '.join(rewritten)}{tail}"
 
 
-def _fix_netflix_table_references(sql: str, expected_table: str = "", action: str = "query") -> str:
-    """Map common LLM mistakes to the actual Snowflake table name (SELECT/aggregate only)."""
-    if action == "create" or _sql_head(sql) == "create":
-        return sql
-    fixed = sql
-    table_clause = r"(FROM|JOIN|INTO|UPDATE|DELETE\s+FROM)"
-    for wrong_name in ("MOVIES", "movies", "MOVIE", "movie", "NETFLIX", "netflix"):
-        fixed = re.sub(
-            rf"\b{table_clause}\s+{wrong_name}\b",
-            r"\1 NETFLIX_TABLE",
-            fixed,
-            flags=re.IGNORECASE,
-        )
-    fixed = re.sub(
-        r"\b(FROM|JOIN)\s+netflix_table\b",
-        r"\1 NETFLIX_TABLE",
-        fixed,
-        flags=re.IGNORECASE,
-    )
-    return fixed
-
-
 def _sanitize_llm_sql(sql_text: str, expected_table: str = "", action: str = "auto") -> str:
     sql = sql_text.strip().strip("`")
     sql = sql.replace("```sql", "").replace("```", "").strip()
@@ -82,7 +59,6 @@ def _sanitize_llm_sql(sql_text: str, expected_table: str = "", action: str = "au
     if lower_sql.startswith("sql"):
         sql = sql[3:].strip()
     sql = _quote_reserved_projection_identifiers(sql)
-    sql = _fix_netflix_table_references(sql, expected_table, action)
     if ";" in sql:
         sql = sql.split(";")[0] + ";"
     elif sql:
@@ -318,7 +294,7 @@ def generate_sql(prompt: str, intent: str, params: dict) -> tuple[str, str]:
     for _ in range(3):
         llm_sql = call_llm_for_sql(
             prompt=llm_prompt,
-            schema_hint=settings.table_hints,
+            schema_hint=get_snowflake_schema_hint(),
             action=action,
             expected_table=expected_table,
             insert_columns_hint=insert_columns_hint,

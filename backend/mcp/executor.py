@@ -38,17 +38,14 @@ def validate_via_mcp() -> str:
         tool_names = [t.get("name", "") for t in tools]
         logger.info("MCP Server tools discovered: %s", tool_names)
 
-        from backend.config import settings
-        expected_tool = settings.mcp_tool_name.strip()
+        from backend.mcp.tool_registry import resolve_snowflake_sql_tool
 
-        if expected_tool not in tool_names:
-            raise RuntimeError(
-                f"MCP tool '{expected_tool}' not found on server. "
-                f"Available tools: {tool_names}. "
-                "Verify the MCP server specification in Snowflake."
-            )
+        sql_tool = resolve_snowflake_sql_tool(tools)
 
-        return "Passed — MCP Server verified"
+        return (
+            f"Passed — Snowflake hosted MCP Server verified | "
+            f"SQL tool: {sql_tool} | Tools: {', '.join(tool_names[:8])}"
+        )
     except RuntimeError:
         raise
     except Exception as exc:

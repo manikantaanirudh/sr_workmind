@@ -180,24 +180,61 @@ def _sf_send_rpc(payload: dict, retry: bool = True, timeout: float = 120.0) -> d
 # Tool Discovery
 # ---------------------------------------------------------------------------
 
-def sf_mcp_tools_list() -> list[dict]:
-    """Retrieve the list of available tools from Salesforce MCP Server.
+_sf_tools_cache: list[dict] | None = None
 
-    Note: The Salesforce Hosted MCP Server processes this asynchronously and returns an empty 
-    body (HTTP 200). We catch the JSON error and return a static list for validation UI.
+
+def sf_mcp_tools_list(force_refresh: bool = False) -> list[dict]:
+    """Retrieve tools from Salesforce hosted MCP server (tools/list).
+
+    See: https://developer.salesforce.com/docs/platform/hosted-mcp-servers/
     """
+    global _sf_tools_cache
+    if _sf_tools_cache is not None and not force_refresh:
+        return _sf_tools_cache
+
     payload = _sf_jsonrpc_request("tools/list")
-    try:
-        response = _sf_send_rpc(payload)
-        # Parse standard tools/list response
-        if "result" in response and "tools" in response["result"]:
-            return response["result"]["tools"]
-        return []
-    except RuntimeError as e:
-        if "JSON" in str(e) or "empty" in str(e).lower():
-            # Fallback for validation since tools/list is not synchronously supported
-            return [{"name": "soqlQuery"}, {"name": "createSobjectRecord"}, {"name": "updateSobjectRecord"}, {"name": "deleteSobjectRecord"}]
-        raise e
+    response = _sf_send_rpc(payload)
+    tools: list[dict] = []
+    if isinstance(response, dict):
+        if "tools" in response:
+            tools = response.get("tools", [])
+        elif "result" in response and isinstance(response["result"], dict):
+            tools = response["result"].get("tools", [])
+
+    if not tools:
+        raise RuntimeError(
+            "Salesforce hosted MCP server returned no tools from tools/list. "
+            "Verify OAuth (mcp_api scope) and SALESFORCE_MCP_SERVER_URL."
+        )
+
+    _sf_tools_cache = tools
+    return tools
+
+
+def _build_sf_tool_arguments(tool_name: str, value_map: dict[str, Any]) -> dict[str, Any]:
+    """Map logical argument names to the tool's declared inputSchema property names."""
+    for tool in sf_mcp_tools_list():
+        if tool.get("name") != tool_name:
+            continue
+        schema = tool.get("inputSchema") or tool.get("input_schema") or {}
+        properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
+        if not properties:
+            break
+        arguments: dict[str, Any] = {}
+        for prop in properties:
+            if prop in value_map:
+                arguments[prop] = value_map[prop]
+                continue
+            prop_lower = prop.lower().replace("-", "").replace("_", "")
+            for key, val in value_map.items():
+                key_norm = key.lower().replace("-", "").replace("_", "")
+                if prop_lower == key_norm:
+                    arguments[prop] = val
+                    break
+        if arguments:
+            return arguments
+
+    return {k: v for k, v in value_map.items() if v is not None}
 
 
 # ---------------------------------------------------------------------------
@@ -234,28 +271,17 @@ def sf_mcp_tools_call(tool_name: str, arguments: dict[str, Any]) -> dict:
 # ---------------------------------------------------------------------------
 
 def execute_soql_via_mcp(soql: str) -> tuple[list[str], list[list[Any]]]:
-    """Execute a SOQL query through the Salesforce MCP Server.
+    """Execute SOQL via Salesforce hosted MCP server (soqlQuery tool)."""
+    from backend.mcp.tool_registry import resolve_salesforce_tool
 
-    Args:
-        soql: The SOQL query string.
-
-    Returns:
-        A tuple of (columns, rows) matching the frontend contract.
-    """
-    # Clean the SOQL
-    clean_soql = soql.strip()
-    if clean_soql.endswith(";"):
-        clean_soql = clean_soql[:-1]
-
-    print(f"[SF MCP] Executing SOQL: {clean_soql}")
-
-    result = sf_mcp_tools_call("soqlQuery", {
-        "query": clean_soql,
-        "soql": clean_soql,
-        "q": clean_soql
-    })
-
-    # Parse the MCP response into columns + rows
+    clean_soql = soql.strip().rstrip(";")
+    tool_name = resolve_salesforce_tool("soqlQuery", "soql_query")
+    arguments = _build_sf_tool_arguments(
+        tool_name,
+        {"query": clean_soql, "soql": clean_soql, "q": clean_soql},
+    )
+    logger.info("Salesforce MCP tools/call -> %s", tool_name)
+    result = sf_mcp_tools_call(tool_name, arguments)
     return _parse_sf_tool_result(result)
 
 
@@ -268,12 +294,19 @@ def execute_sf_search(search_query: str) -> tuple[list[str], list[list[Any]]]:
     Returns:
         A tuple of (columns, rows).
     """
-    result = sf_mcp_tools_call("find", {
-        "search": search_query,
-        "query": search_query,
-        "q": search_query,
-        "sosl": search_query
-    })
+    from backend.mcp.tool_registry import resolve_salesforce_tool
+
+    tool_name = resolve_salesforce_tool("find", "search")
+    arguments = _build_sf_tool_arguments(
+        tool_name,
+        {
+            "search": search_query,
+            "query": search_query,
+            "q": search_query,
+            "sosl": search_query,
+        },
+    )
+    result = sf_mcp_tools_call(tool_name, arguments)
     return _parse_sf_tool_result(result)
 
 
@@ -287,10 +320,20 @@ def create_sf_record(sobject_name: str, fields: dict[str, Any]) -> tuple[list[st
     Returns:
         A tuple of (columns, rows) with the created record info.
     """
-    result = sf_mcp_tools_call("createSobjectRecord", {
-        "sobject-name": sobject_name,
-        "body": fields,
-    })
+    from backend.mcp.tool_registry import resolve_salesforce_tool
+
+    tool_name = resolve_salesforce_tool("createSobjectRecord", "create_sobject_record")
+    arguments = _build_sf_tool_arguments(
+        tool_name,
+        {
+            "sobject-name": sobject_name,
+            "sobject_name": sobject_name,
+            "object": sobject_name,
+            "body": fields,
+            "fields": fields,
+        },
+    )
+    result = sf_mcp_tools_call(tool_name, arguments)
     content = result.get("content", [])
     if content:
         text = content[0].get("text", "")
@@ -314,11 +357,21 @@ def update_sf_record(sobject_name: str, record_id: str, fields: dict[str, Any]) 
     Returns:
         A tuple of (columns, rows) with the update result.
     """
-    result = sf_mcp_tools_call("updateSobjectRecord", {
-        "sobject-name": sobject_name,
-        "id": record_id,
-        "body": fields,
-    })
+    from backend.mcp.tool_registry import resolve_salesforce_tool
+
+    tool_name = resolve_salesforce_tool("updateSobjectRecord", "update_sobject_record")
+    arguments = _build_sf_tool_arguments(
+        tool_name,
+        {
+            "sobject-name": sobject_name,
+            "sobject_name": sobject_name,
+            "id": record_id,
+            "record_id": record_id,
+            "body": fields,
+            "fields": fields,
+        },
+    )
+    result = sf_mcp_tools_call(tool_name, arguments)
     return ["status"], [["Record updated successfully."]]
 
 
@@ -332,10 +385,19 @@ def delete_sf_record(sobject_name: str, record_id: str) -> tuple[list[str], list
     Returns:
         A tuple of (columns, rows) with the delete result.
     """
-    result = sf_mcp_tools_call("deleteSobjectRecord", {
-        "sobject-name": sobject_name,
-        "id": record_id,
-    })
+    from backend.mcp.tool_registry import resolve_salesforce_tool
+
+    tool_name = resolve_salesforce_tool("deleteSobjectRecord", "delete_sobject_record")
+    arguments = _build_sf_tool_arguments(
+        tool_name,
+        {
+            "sobject-name": sobject_name,
+            "sobject_name": sobject_name,
+            "id": record_id,
+            "record_id": record_id,
+        },
+    )
+    result = sf_mcp_tools_call(tool_name, arguments)
     return ["status"], [["Record deleted successfully."]]
 
 
@@ -348,10 +410,21 @@ def get_sf_schema(object_name: str = "") -> tuple[list[str], list[list[Any]]]:
     Returns:
         A tuple of (columns, rows).
     """
-    args = {}
+    from backend.mcp.tool_registry import resolve_salesforce_tool
+
+    tool_name = resolve_salesforce_tool("getObjectSchema", "get_object_schema")
+    value_map: dict[str, Any] = {}
     if object_name:
-        args["object-name"] = object_name
-    result = sf_mcp_tools_call("getObjectSchema", args)
+        value_map.update(
+            {
+                "object-name": object_name,
+                "object_name": object_name,
+                "object": object_name,
+                "sobject": object_name,
+            }
+        )
+    arguments = _build_sf_tool_arguments(tool_name, value_map)
+    result = sf_mcp_tools_call(tool_name, arguments)
     return _parse_sf_tool_result(result)
 
 

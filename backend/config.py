@@ -17,8 +17,8 @@ class Settings:
     public_backend_url: str = os.getenv("PUBLIC_BACKEND_URL", "")
     oauth_redirect_base_url: str = os.getenv("OAUTH_REDIRECT_BASE_URL", "")
     token_storage_dir: str = os.getenv("TOKEN_STORAGE_DIR", str(backend_dir / "logs"))
-    # Prefer Snowflake SQL API (PAT) over MCP tools/call when true (default on).
-    snowflake_use_sql_api: bool = os.getenv("SNOWFLAKE_USE_SQL_API", "true").strip().lower() in {
+    # Optional emergency fallback only — SR WorkMind uses Snowflake hosted MCP by default.
+    snowflake_use_sql_api: bool = os.getenv("SNOWFLAKE_USE_SQL_API", "false").strip().lower() in {
         "1",
         "true",
         "yes",
@@ -55,13 +55,8 @@ class Settings:
     snowflake_warehouse: str = os.getenv("SNOWFLAKE_WAREHOUSE", "")
     snowflake_role: str = os.getenv("SNOWFLAKE_ROLE", "")
 
-    table_hints: str = os.getenv(
-        "SNOWFLAKE_TABLE_HINTS",
-        "NETFLIX_TABLE(show_id, type, title, director, cast, country, date_added, "
-        "release_year, rating, duration, listed_in, description); "
-        "customers(customer_name, revenue, region); "
-        "orders(order_id, customer_name, order_date, sales_amount)",
-    )
+    # Optional override; when empty, schema is discovered via Snowflake MCP + INFORMATION_SCHEMA.
+    table_hints: str = os.getenv("SNOWFLAKE_TABLE_HINTS", "")
 
     # ── Salesforce Hosted MCP Server ──
     salesforce_instance_url: str = os.getenv("SALESFORCE_INSTANCE_URL", "")
@@ -70,15 +65,8 @@ class Settings:
         "SALESFORCE_MCP_SERVER_URL",
         "https://api.salesforce.com/platform/mcp/v1/platform/sobject-all",
     )
-    salesforce_object_hints: str = os.getenv(
-        "SALESFORCE_OBJECT_HINTS",
-        "Account(Id, Name, Industry, Type, Phone, Website, BillingCity, BillingState); "
-        "Contact(Id, FirstName, LastName, Email, Phone, AccountId, Title, Department); "
-        "Opportunity(Id, Name, StageName, Amount, CloseDate, AccountId, Probability); "
-        "Case(Id, Subject, Status, Priority, ContactId, AccountId, Description); "
-        "Lead(Id, FirstName, LastName, Company, Status, Email, Phone, Industry); "
-        "Task(Id, Subject, Status, Priority, WhoId, WhatId, ActivityDate)",
-    )
+    # Optional override; when empty, schema is discovered via Salesforce MCP getObjectSchema.
+    salesforce_object_hints: str = os.getenv("SALESFORCE_OBJECT_HINTS", "")
 
     # Docusign Fully Managed MCP Server (Beta)
     docusign_client_id: str = os.getenv("DOCUSIGN_CLIENT_ID", "")

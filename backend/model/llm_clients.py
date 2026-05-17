@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import time
@@ -389,5 +389,63 @@ def call_llm_for_ds_operation(prompt: str, tools_schema: str) -> str:
                 return data["choices"][0]["message"]["content"].strip()
     except Exception as e:
         print(f"Groq Error: {e}")
-        
+
     return '{"tool_name": "getTemplates", "arguments": {}}'
+
+
+def call_llm_classify_intent(prompt: str) -> dict:
+    """Classify platform and action dynamically (no hardcoded table/object lists)."""
+    system_prompt = (
+        "You route natural-language requests to the correct data platform. "
+        "Return ONLY valid JSON with this shape: "
+        '{"platform":"snowflake|salesforce|docusign",'
+        '"action":"query|create|insert|update|delete|search|schema|auto",'
+        '"sobject_name":"",'
+        '"expected_table":""}. '
+        "Use platform=snowflake for SQL/warehouse/table/analytics requests. "
+        "Use platform=salesforce for CRM/Account/Contact/Opportunity/SOQL requests. "
+        "Use platform=docusign for envelopes, agreements, contracts, or signing. "
+        "Set expected_table only when the user names a specific Snowflake table. "
+        "Set sobject_name only when the user names a Salesforce object (e.g. Account). "
+        "Infer action from verbs (show/list/query vs create vs update vs delete)."
+    )
+
+    provider = settings.llm_provider.lower()
+    text = ""
+
+    if provider == "groq":
+        if not settings.groq_api_key:
+            raise RuntimeError("GROQ_API_KEY is missing")
+        payload = {
+            "model": settings.groq_model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+        }
+        headers = {
+            "Authorization": f"Bearer {settings.groq_api_key}",
+            "Content-Type": "application/json",
+        }
+        with httpx.Client(timeout=30.0, verify=False) as client:
+            response = client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers=headers,
+                content=json.dumps(payload),
+            )
+            response.raise_for_status()
+            text = _extract_text(response.json()).strip()
+    else:
+        text = call_llm_for_sql(
+            prompt=f"User request: {prompt}",
+            schema_hint=system_prompt,
+            action="auto",
+        )
+
+    cleaned = text.strip().strip("`").replace("```json", "").replace("```", "").strip()
+    data = json.loads(cleaned)
+    if not isinstance(data, dict):
+        raise ValueError("LLM classification did not return a JSON object.")
+    return data

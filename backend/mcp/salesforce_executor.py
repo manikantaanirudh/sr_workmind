@@ -20,7 +20,7 @@ from backend.mcp.salesforce_mcp_client import (
     get_sf_schema,
     update_sf_record,
 )
-from backend.mcp.salesforce_rest import execute_soql_via_rest
+from backend.mcp.salesforce_mcp_client import sf_mcp_tools_list
 from backend.mcp.salesforce_oauth import is_authenticated
 
 logger = logging.getLogger(__name__)
@@ -41,7 +41,16 @@ def sf_validate_via_mcp() -> str:
     if not is_authenticated():
         return "Validation failed or backend unavailable — Salesforce not authenticated"
 
-    return "Passed — Salesforce OAuth connected | Routing check: PASS"
+    try:
+        tools = sf_mcp_tools_list()
+        tool_names = [str(t.get("name", "")) for t in tools if t.get("name")]
+        return (
+            "Passed — Salesforce hosted MCP Server verified | "
+            f"Tools: {', '.join(tool_names[:8])}"
+        )
+    except Exception as exc:
+        logger.warning("Salesforce MCP validation error: %s", exc)
+        return f"Validation failed or backend unavailable — {exc}"
 
 
 # ---------------------------------------------------------------------------
@@ -83,11 +92,7 @@ def sf_route_and_execute(
     sf_params = sf_params or {}
 
     if action in ("query", "soql_query"):
-        try:
-            return execute_soql_via_rest(soql_or_operation)
-        except Exception as exc:
-            logger.warning("Salesforce REST SOQL failed, falling back to MCP: %s", exc)
-            return execute_soql_via_mcp(soql_or_operation)
+        return execute_soql_via_mcp(soql_or_operation)
 
     elif action == "search":
         return execute_sf_search(soql_or_operation)
@@ -119,8 +124,4 @@ def sf_route_and_execute(
         return get_sf_schema(object_name)
 
     else:
-        try:
-            return execute_soql_via_rest(soql_or_operation)
-        except Exception as exc:
-            logger.warning("Salesforce REST SOQL failed, falling back to MCP: %s", exc)
-            return execute_soql_via_mcp(soql_or_operation)
+        return execute_soql_via_mcp(soql_or_operation)
