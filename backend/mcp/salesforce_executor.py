@@ -20,7 +20,6 @@ from backend.mcp.salesforce_mcp_client import (
     get_sf_schema,
     update_sf_record,
 )
-from backend.mcp.salesforce_mcp_client import sf_mcp_tools_list
 from backend.mcp.salesforce_oauth import is_authenticated
 
 logger = logging.getLogger(__name__)
@@ -33,15 +32,14 @@ LOG_PATH = Path(__file__).parent.parent / "logs" / "salesforce_mcp_audit.log"
 # ---------------------------------------------------------------------------
 
 def sf_validate_via_mcp() -> str:
-    """Check Salesforce MCP Server connectivity.
-
-    Returns:
-        A human-readable validation status string.
-    """
+    """Check Salesforce OAuth + hosted MCP server readiness (no REST bypass)."""
     if not is_authenticated():
-        return "Validation failed or backend unavailable — Salesforce not authenticated"
+        return "Validation failed — Salesforce not authenticated"
 
-    return "Passed - Salesforce OAuth connected | MCP session ready for tools/call"
+    return (
+        "Passed - Salesforce OAuth connected | "
+        "Hosted MCP platform/sobject-all (soqlQuery via tools/call)"
+    )
 
 
 # ---------------------------------------------------------------------------

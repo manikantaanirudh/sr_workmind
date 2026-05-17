@@ -88,18 +88,9 @@ class Settings:
     )
     # Optional override; when empty, schema is discovered via Salesforce MCP getObjectSchema.
     salesforce_object_hints: str = os.getenv("SALESFORCE_OBJECT_HINTS", "")
-    salesforce_mcp_timeout_sec: int = int(os.getenv("SALESFORCE_MCP_TIMEOUT_SEC", "120"))
-    salesforce_mcp_soql_timeout_sec: int = int(os.getenv("SALESFORCE_MCP_SOQL_TIMEOUT_SEC", "35"))
+    salesforce_mcp_timeout_sec: int = int(os.getenv("SALESFORCE_MCP_TIMEOUT_SEC", "90"))
+    salesforce_mcp_init_timeout_sec: int = int(os.getenv("SALESFORCE_MCP_INIT_TIMEOUT_SEC", "30"))
     salesforce_soql_row_limit: int = int(os.getenv("SALESFORCE_SOQL_ROW_LIMIT", "50"))
-    salesforce_api_version: str = os.getenv("SALESFORCE_API_VERSION", "v59.0")
-    # When MCP soqlQuery is slow (common on Render), use REST Query API with same OAuth token.
-    salesforce_rest_soql_fallback: bool = os.getenv(
-        "SALESFORCE_REST_SOQL_FALLBACK", "true"
-    ).strip().lower() in {"1", "true", "yes", "on"}
-    salesforce_rest_soql_first: bool = os.getenv(
-        "SALESFORCE_REST_SOQL_FIRST",
-        "true" if os.getenv("APP_ENV", "").lower() == "production" else "false",
-    ).strip().lower() in {"1", "true", "yes", "on"}
 
     # Docusign Fully Managed MCP Server (Beta)
     docusign_client_id: str = os.getenv("DOCUSIGN_CLIENT_ID", "")
