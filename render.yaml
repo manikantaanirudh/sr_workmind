@@ -72,7 +72,7 @@ services:
     name: sr-workmind-frontend
     runtime: node
     plan: free
-    buildCommand: npm ci && npm run build
+    buildCommand: npm ci --include=optional && npm run build
     startCommand: npm start
     healthCheckPath: /
     envVars:

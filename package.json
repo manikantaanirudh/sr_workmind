@@ -7,9 +7,12 @@
   },
   "scripts": {
     "dev": "next dev --webpack",
-    "build": "next build",
+    "build": "next build --webpack",
     "start": "next start -H 0.0.0.0",
     "lint": "eslint"
+  },
+  "optionalDependencies": {
+    "lightningcss-linux-x64-gnu": "1.32.0"
   },
   "dependencies": {
     "next": "16.2.2",
