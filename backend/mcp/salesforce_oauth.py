@@ -27,7 +27,7 @@ from urllib.parse import urlencode
 
 import httpx
 
-from backend.config import settings
+from backend.config import resolve_salesforce_oauth_base_url, settings
 
 logger = logging.getLogger(__name__)
 
@@ -134,10 +134,10 @@ def get_salesforce_auth_url(redirect_uri: str) -> str:
     instance_url = settings.salesforce_instance_url.strip().rstrip("/")
     consumer_key = settings.salesforce_consumer_key.strip()
 
-    if not instance_url or not consumer_key:
-        raise RuntimeError(
-            "SALESFORCE_INSTANCE_URL and SALESFORCE_CONSUMER_KEY are required in .env"
-        )
+    if not consumer_key:
+        raise RuntimeError("SALESFORCE_CONSUMER_KEY is required in .env")
+
+    oauth_base = resolve_salesforce_oauth_base_url(instance_url)
 
     code_verifier = _generate_code_verifier()
     code_challenge = _generate_code_challenge(code_verifier)
@@ -147,6 +147,7 @@ def get_salesforce_auth_url(redirect_uri: str) -> str:
     _pkce_state["code_verifier"] = code_verifier
     _pkce_state["state"] = state
     _pkce_state["redirect_uri"] = redirect_uri
+    _pkce_state["oauth_base_url"] = oauth_base
     _save_pkce_state()
 
     params = {
@@ -159,7 +160,7 @@ def get_salesforce_auth_url(redirect_uri: str) -> str:
         "code_challenge_method": "S256",
     }
 
-    auth_url = f"{instance_url}/services/oauth2/authorize?{urlencode(params)}"
+    auth_url = f"{oauth_base}/services/oauth2/authorize?{urlencode(params)}"
     logger.info("Salesforce OAuth URL generated: %s", auth_url)
     return auth_url
 
@@ -187,8 +188,11 @@ def exchange_code_for_tokens(code: str, state: str) -> dict[str, Any]:
     redirect_uri = _pkce_state.get("redirect_uri", "")
     instance_url = settings.salesforce_instance_url.strip().rstrip("/")
     consumer_key = settings.salesforce_consumer_key.strip()
+    oauth_base = _pkce_state.get("oauth_base_url") or resolve_salesforce_oauth_base_url(
+        instance_url
+    )
 
-    token_url = f"{instance_url}/services/oauth2/token"
+    token_url = f"{oauth_base}/services/oauth2/token"
 
     payload = {
         "grant_type": "authorization_code",
@@ -215,6 +219,7 @@ def exchange_code_for_tokens(code: str, state: str) -> dict[str, Any]:
         "access_token": token_data.get("access_token", ""),
         "refresh_token": token_data.get("refresh_token", ""),
         "instance_url": token_data.get("instance_url", instance_url),
+        "oauth_base_url": oauth_base,
         "token_type": token_data.get("token_type", "Bearer"),
         "issued_at": token_data.get("issued_at", str(int(time.time() * 1000))),
         "expires_in": 7200,  # Salesforce tokens typically expire in 2 hours
@@ -235,10 +240,16 @@ def exchange_code_for_tokens(code: str, state: str) -> dict[str, Any]:
 
 def _refresh_access_token(refresh_token: str) -> dict[str, Any]:
     """Use the refresh token to obtain a new access token."""
-    instance_url = settings.salesforce_instance_url.strip().rstrip("/")
+    tokens_existing = _load_tokens()
+    instance_url = tokens_existing.get(
+        "instance_url", settings.salesforce_instance_url.strip().rstrip("/")
+    )
     consumer_key = settings.salesforce_consumer_key.strip()
+    oauth_base = tokens_existing.get("oauth_base_url") or resolve_salesforce_oauth_base_url(
+        instance_url
+    )
 
-    token_url = f"{instance_url}/services/oauth2/token"
+    token_url = f"{oauth_base}/services/oauth2/token"
 
     payload = {
         "grant_type": "refresh_token",
@@ -270,6 +281,7 @@ def _refresh_access_token(refresh_token: str) -> dict[str, Any]:
     if token_data.get("refresh_token"):
         tokens["refresh_token"] = token_data["refresh_token"]
     tokens["instance_url"] = token_data.get("instance_url", instance_url)
+    tokens["oauth_base_url"] = oauth_base
     tokens["issued_at"] = token_data.get("issued_at", str(int(time.time() * 1000)))
     tokens["obtained_at"] = time.time()
     tokens["expires_in"] = int(token_data.get("expires_in", tokens.get("expires_in", 7200)))

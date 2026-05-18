@@ -18,12 +18,14 @@ from typing import Any
 import httpx
 
 from backend.config import resolve_salesforce_mcp_server_url, settings
-from backend.mcp.mcp_protocol import decode_rpc_response
+from backend.mcp.mcp_protocol import decode_rpc_response, decode_sse_stream
 from backend.mcp.salesforce_oauth import get_valid_access_token
 
 logger = logging.getLogger(__name__)
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
+# Required by Salesforce hosted MCP (HTTP 406 if either is missing).
+SF_MCP_ACCEPT = "application/json, text/event-stream"
 SF_CONNECTOR_LABEL = "Salesforce Hosted MCP Server (platform/sobject-all)"
 
 _sf_session_id: str | None = None
@@ -101,7 +103,11 @@ def probe_salesforce_connectivity() -> dict[str, Any]:
 
     out["oauth"] = auth_status()
     try:
-        out["instance_url"] = get_instance_url()
+        from backend.config import resolve_salesforce_oauth_base_url
+
+        inst = get_instance_url()
+        out["instance_url"] = inst
+        out["oauth_base_url"] = resolve_salesforce_oauth_base_url(inst)
         out["mcp_org_tier"] = "sandbox" if "/sandbox/" in url else "production"
     except RuntimeError:
         out["instance_url"] = None
@@ -130,26 +136,33 @@ def _sf_timeout(read_sec: float) -> httpx.Timeout:
     return httpx.Timeout(connect=20.0, read=read_sec, write=30.0, pool=20.0)
 
 
-def _sf_auth_headers(
-    *,
-    include_session: bool = True,
-    accept_sse: bool = True,
-) -> dict[str, str]:
+def _sf_auth_headers(*, include_session: bool = True) -> dict[str, str]:
     access_token = get_valid_access_token()
-    accept = (
-        "application/json, text/event-stream"
-        if accept_sse
-        else "application/json"
-    )
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
-        "Accept": accept,
+        "Accept": SF_MCP_ACCEPT,
         "Mcp-Protocol-Version": MCP_PROTOCOL_VERSION,
     }
     if include_session and _sf_session_id:
         headers["Mcp-Session-Id"] = _sf_session_id
     return headers
+
+
+def _read_mcp_http_response(response: httpx.Response) -> dict[str, Any]:
+    """Decode Salesforce MCP JSON or SSE response without waiting for stream close."""
+    content_type = response.headers.get("content-type", "").lower()
+    if "text/event-stream" in content_type:
+        return decode_sse_stream(response)
+    body = response.read()
+    if not body.strip():
+        return {}
+    wrapped = httpx.Response(
+        status_code=response.status_code,
+        content=body,
+        headers=response.headers,
+    )
+    return decode_rpc_response(wrapped)
 
 
 def _sf_jsonrpc_request(
@@ -172,7 +185,7 @@ def _send_initialized(client: httpx.Client, url: str) -> None:
     timeout = _sf_timeout(float(settings.salesforce_mcp_init_timeout_sec))
     response = client.post(
         url,
-        headers=_sf_auth_headers(accept_sse=False),
+        headers=_sf_auth_headers(),
         json=payload,
         timeout=timeout,
     )
@@ -209,33 +222,34 @@ def _ensure_session(client: httpx.Client, url: str) -> None:
         },
         request_id=9999,
     )
-    response = client.post(
+    with client.stream(
+        "POST",
         url,
         headers=_sf_auth_headers(include_session=False),
         json=init_payload,
         timeout=_sf_timeout(init_timeout),
-    )
+    ) as response:
+        if response.status_code == 401:
+            raise RuntimeError(
+                "Salesforce MCP authentication failed (401). Reconnect at /auth/salesforce."
+            )
+        if response.status_code not in {200, 202}:
+            body = response.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"Failed to initialize Salesforce MCP session ({response.status_code}): "
+                f"{body[:300]}"
+            )
 
-    if response.status_code == 401:
-        raise RuntimeError(
-            "Salesforce MCP authentication failed (401). Reconnect at /auth/salesforce."
+        _sf_session_id = response.headers.get("mcp-session-id") or response.headers.get(
+            "Mcp-Session-Id"
         )
-    if response.status_code not in {200, 202}:
-        raise RuntimeError(
-            f"Failed to initialize Salesforce MCP session ({response.status_code}): "
-            f"{response.text[:300]}"
-        )
+        if not _sf_session_id:
+            raise RuntimeError(
+                "Salesforce MCP initialize succeeded but no Mcp-Session-Id header was returned."
+            )
 
-    _sf_session_id = response.headers.get("mcp-session-id") or response.headers.get(
-        "Mcp-Session-Id"
-    )
-    if not _sf_session_id:
-        raise RuntimeError(
-            "Salesforce MCP initialize succeeded but no Mcp-Session-Id header was returned."
-        )
-
-    _sf_session_url = url
-    init_data = decode_rpc_response(response)
+        _sf_session_url = url
+        init_data = _read_mcp_http_response(response)
     if init_data.get("error"):
         err = init_data["error"]
         raise RuntimeError(
@@ -252,10 +266,9 @@ def _sf_send_rpc(
     *,
     retry: bool = True,
     read_timeout: float | None = None,
-    accept_sse: bool = False,
     url: str | None = None,
 ) -> dict[str, Any]:
-    """POST JSON-RPC to Salesforce hosted MCP."""
+    """POST JSON-RPC to Salesforce hosted MCP (Streamable HTTP + SSE-safe read)."""
     mcp_url = (url or _mcp_url()).strip()
     if not mcp_url:
         raise RuntimeError("Salesforce MCP server URL is not configured.")
@@ -268,31 +281,38 @@ def _sf_send_rpc(
     try:
         with httpx.Client(timeout=timeout, follow_redirects=True, verify=False) as client:
             _ensure_session(client, mcp_url)
-            headers = _sf_auth_headers(accept_sse=accept_sse)
+            headers = _sf_auth_headers()
             logger.info("SF MCP RPC -> %s method=%s", mcp_url, payload.get("method"))
-            response = client.post(
+            with client.stream(
+                "POST",
                 mcp_url,
                 headers=headers,
                 json=payload,
                 timeout=timeout,
-            )
+            ) as response:
+                if response.status_code == 401:
+                    raise RuntimeError(
+                        "Salesforce MCP Server authentication failed (401). "
+                        "Reconnect at /auth/salesforce."
+                    )
+                if response.status_code == 403:
+                    raise RuntimeError(
+                        "Salesforce MCP Server access denied (403). "
+                        "Check External Client App and user permissions."
+                    )
+                if response.status_code == 406:
+                    body = response.read().decode("utf-8", errors="replace")
+                    raise RuntimeError(
+                        f"Salesforce MCP HTTP 406: {body[:500]}. "
+                        f"Accept header must be: {SF_MCP_ACCEPT}"
+                    )
+                if response.status_code not in {200, 202}:
+                    body = response.read().decode("utf-8", errors="replace")
+                    raise RuntimeError(
+                        f"Salesforce MCP HTTP {response.status_code}: {body[:500]}"
+                    )
 
-            if response.status_code == 401:
-                raise RuntimeError(
-                    "Salesforce MCP Server authentication failed (401). "
-                    "Reconnect at /auth/salesforce."
-                )
-            if response.status_code == 403:
-                raise RuntimeError(
-                    "Salesforce MCP Server access denied (403). "
-                    "Check External Client App and user permissions."
-                )
-            if response.status_code not in {200, 202}:
-                raise RuntimeError(
-                    f"Salesforce MCP HTTP {response.status_code}: {response.text[:500]}"
-                )
-
-            data = decode_rpc_response(response)
+                data = _read_mcp_http_response(response)
 
     except httpx.ReadTimeout as exc:
         _reset_sf_session()
@@ -329,7 +349,6 @@ def _sf_send_rpc(
                 new_payload,
                 retry=False,
                 read_timeout=read_sec,
-                accept_sse=accept_sse,
                 url=mcp_url,
             )
 
@@ -343,7 +362,7 @@ def sf_mcp_tools_list(force_refresh: bool = False) -> list[dict]:
 
     try:
         payload = _sf_jsonrpc_request("tools/list")
-        response = _sf_send_rpc(payload, read_timeout=25.0, accept_sse=True)
+        response = _sf_send_rpc(payload, read_timeout=25.0)
         tools: list[dict] = []
         if isinstance(response, dict):
             tools = response.get("tools", [])

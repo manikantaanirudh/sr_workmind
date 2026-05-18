@@ -169,6 +169,23 @@ def _is_sandbox_salesforce_instance(instance_url: str) -> bool:
     )
 
 
+def resolve_salesforce_oauth_base_url(instance_url: str = "") -> str:
+    """OAuth authorize/token host (not the My Domain instance URL).
+
+    Scratch/sandbox orgs must use test.salesforce.com — instance URLs like
+    *.develop.my.salesforce.com return 404 on /services/oauth2/authorize.
+    See: https://developer.salesforce.com/docs/platform/hosted-mcp-servers/guide/create-external-client-app.html
+    """
+    override = os.getenv("SALESFORCE_OAUTH_BASE_URL", "").strip().rstrip("/")
+    if override:
+        return override
+
+    inst = (instance_url or settings.salesforce_instance_url).strip().rstrip("/")
+    if inst and _is_sandbox_salesforce_instance(inst):
+        return "https://test.salesforce.com"
+    return "https://login.salesforce.com"
+
+
 def resolve_salesforce_mcp_server_url(instance_url: str = "") -> str:
     """Resolve hosted MCP URL for the connected org (production vs sandbox path)."""
     configured = settings.salesforce_mcp_server_url.strip()
