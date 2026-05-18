@@ -190,9 +190,11 @@ def call_llm_for_sql(
 def call_llm_resolve_sobject(prompt: str) -> str:
     """Return a single Salesforce SObject API name (PascalCase) for the user prompt."""
     system_prompt = (
-        "You identify Salesforce SObject API names from user requests. "
-        "Reply with exactly one PascalCase API name (e.g. Account, Opportunity, Contact). "
-        "No markdown, no explanation, no quotes."
+        "You map natural language to exactly one Salesforce SObject API name (PascalCase). "
+        "Examples: accounts->Account, contacts->Contact, opportunities/opps->Opportunity, "
+        "leads->Lead, cases->Case, campaigns->Campaign. "
+        "Pick the object the user is asking about, not a related lookup field. "
+        "Reply with only the API name. No markdown, no quotes."
     )
     provider = settings.llm_provider.lower()
 
@@ -279,21 +281,27 @@ def call_llm_for_soql(
     Uses the same provider infrastructure as call_llm_for_sql but with
     a Salesforce-specific system prompt.
     """
+    object_lock = ""
+    if sobject_name:
+        object_lock = (
+            f"The query MUST use FROM {sobject_name} only. "
+            f"Do not query Contact unless the user asked for contacts. "
+        )
     system_prompt = (
         "You are an enterprise Salesforce SOQL assistant. "
         f"{_soql_statement_constraint(action, sobject_name)} "
-        "SOQL syntax: SELECT fields FROM Object WHERE conditions ORDER BY field LIMIT n. "
+        f"{object_lock}"
+        "SOQL syntax: SELECT fields FROM Object WHERE conditions ORDER BY field ASC|DESC LIMIT n. "
         "Important SOQL rules: "
+        "- Use API field names (LastName, StageName, CloseDate), not labels. "
+        "- When the user says 'top N' or 'first N', set LIMIT to exactly N. "
+        "- When the user asks to sort/order, include ORDER BY with the correct field. "
+        "- Opportunity closed won: StageName = 'Closed Won'. Closed lost: StageName = 'Closed Lost'. "
         "- Use single quotes for string literals. "
-        "- Use LIKE '%value%' for partial matching. "
-        "- Date formats: YYYY-MM-DD. DateTime: YYYY-MM-DDThh:mm:ssZ. "
-        "- Supported aggregate functions: COUNT(), SUM(), AVG(), MIN(), MAX(). "
-        "- Use GROUP BY with aggregates. "
-        "- Always include WHERE and LIMIT clauses (required by Salesforce hosted MCP). "
-        "- For broad reads use a safe filter such as WHERE Id != null. "
+        "- Always include WHERE and LIMIT (required by Salesforce hosted MCP). "
+        "- If no filter is specified, use WHERE Id != null. "
         "No markdown, no explanation, no prose. "
-        "Use only the provided schema when possible: "
-        f"{object_hints}."
+        f"{object_hints}"
     )
 
     provider = settings.llm_provider.lower()
