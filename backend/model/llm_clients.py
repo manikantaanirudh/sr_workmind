@@ -187,6 +187,79 @@ def call_llm_for_sql(
 # Salesforce SOQL generation
 # ---------------------------------------------------------------------------
 
+def call_llm_resolve_sobject(prompt: str) -> str:
+    """Return a single Salesforce SObject API name (PascalCase) for the user prompt."""
+    system_prompt = (
+        "You identify Salesforce SObject API names from user requests. "
+        "Reply with exactly one PascalCase API name (e.g. Account, Opportunity, Contact). "
+        "No markdown, no explanation, no quotes."
+    )
+    provider = settings.llm_provider.lower()
+
+    if provider == "groq":
+        if not settings.groq_api_key:
+            raise RuntimeError("GROQ_API_KEY is missing")
+        payload = {
+            "model": settings.groq_model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0,
+            "max_tokens": 32,
+        }
+        headers = {
+            "Authorization": f"Bearer {settings.groq_api_key}",
+            "Content-Type": "application/json",
+        }
+        with httpx.Client(timeout=20.0, verify=False) as client:
+            response = client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers=headers,
+                content=json.dumps(payload),
+            )
+            response.raise_for_status()
+            text = _extract_text(response.json()).strip()
+    elif provider == "gemini":
+        if not settings.gemini_api_key:
+            raise RuntimeError("GEMINI_API_KEY is missing")
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {
+                            "text": (
+                                f"{system_prompt}\n\nUser request: {prompt}\n\n"
+                                "Return only the SObject API name."
+                            )
+                        }
+                    ]
+                }
+            ],
+            "generationConfig": {"temperature": 0, "maxOutputTokens": 32},
+        }
+        with httpx.Client(timeout=20.0, verify=False) as client:
+            response = client.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{settings.gemini_model}:generateContent?key={settings.gemini_api_key}",
+                json=payload,
+            )
+            response.raise_for_status()
+            data = response.json()
+            text = ""
+            if "candidates" in data and data["candidates"]:
+                parts = data["candidates"][0].get("content", {}).get("parts", [])
+                if parts:
+                    text = str(parts[0].get("text", "")).strip()
+    else:
+        raise RuntimeError(f"Unsupported LLM provider for SObject resolution: {provider}")
+
+    token = text.split()[0].strip("`'\".,;") if text else ""
+    if token and token[0].isalpha():
+        return token[0].upper() + token[1:]
+    raise ValueError("Could not resolve a Salesforce object name from the prompt.")
+
+
 def _soql_statement_constraint(action: str, sobject_name: str = "") -> str:
     """Build the SOQL-specific constraint text for the system prompt."""
     obj_hint = f" from the {sobject_name} object" if sobject_name else ""

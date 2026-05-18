@@ -1,5 +1,5 @@
 """
-Salesforce SOQL Generator — Groq LLM + deterministic fallbacks for hosted MCP soqlQuery.
+Salesforce SOQL Generator — MCP schema discovery + Groq for object/filter resolution.
 """
 
 from __future__ import annotations
@@ -8,48 +8,8 @@ import re
 
 from backend.config import settings
 from backend.mcp.salesforce_mcp_client import ensure_mcp_soql
-from backend.mcp.schema_discovery import get_salesforce_schema_hint
-from backend.model.llm_clients import call_llm_for_soql
-
-# Safe templates when Groq output is invalid (always include WHERE + LIMIT for MCP).
-_SOQL_TEMPLATES: dict[str, str] = {
-    "Account": (
-        "SELECT Id, Name, Industry, Type, Phone, Website FROM Account "
-        "WHERE Id != null LIMIT {limit}"
-    ),
-    "Opportunity": (
-        "SELECT Id, Name, StageName, Amount, CloseDate, AccountId FROM Opportunity "
-        "WHERE Id != null LIMIT {limit}"
-    ),
-    "Contact": (
-        "SELECT Id, FirstName, LastName, Email, Phone, AccountId FROM Contact "
-        "WHERE Id != null LIMIT {limit}"
-    ),
-    "Lead": (
-        "SELECT Id, FirstName, LastName, Company, Status, Email FROM Lead "
-        "WHERE Id != null LIMIT {limit}"
-    ),
-    "Case": (
-        "SELECT Id, Subject, Status, Priority, AccountId FROM Case "
-        "WHERE Id != null LIMIT {limit}"
-    ),
-}
-
-
-def infer_sobject_from_prompt(prompt: str) -> str:
-    """Heuristic SObject name from natural language (used when classifier omits it)."""
-    text = prompt.lower()
-    if "opportunit" in text:
-        return "Opportunity"
-    if "contact" in text and "account" not in text:
-        return "Contact"
-    if "lead" in text:
-        return "Lead"
-    if "case" in text:
-        return "Case"
-    if "account" in text:
-        return "Account"
-    return ""
+from backend.mcp.salesforce_schema import build_query_soql, fetch_sobject_field_names
+from backend.model.llm_clients import call_llm_for_soql, call_llm_resolve_sobject
 
 
 def _sanitize_soql(soql_text: str) -> str:
@@ -65,36 +25,82 @@ def _sanitize_soql(soql_text: str) -> str:
     return soql.strip()
 
 
-def _ensure_soql_limit(soql: str, limit: int | None = None) -> str:
-    max_rows = limit if limit is not None else settings.salesforce_soql_row_limit
-    upper = f" {soql.strip().upper()} "
-    if " LIMIT " in upper:
-        return soql.strip()
-    return f"{soql.strip()} LIMIT {max_rows}"
-
-
 def _is_valid_soql(soql: str) -> bool:
     upper = " ".join(soql.strip().upper().split())
-    return upper.startswith("SELECT") and " FROM " in upper
+    if not upper.startswith("SELECT"):
+        return False
+    if " FROM " not in upper:
+        return False
+    if "FIELDS(" in upper or " SELECT *" in upper:
+        return False
+    return True
 
 
-def _template_soql(sobject: str) -> str | None:
-    template = _SOQL_TEMPLATES.get(sobject)
-    if not template:
-        return None
-    return template.format(limit=settings.salesforce_soql_row_limit)
+def _resolve_sobject(prompt: str, params: dict) -> str:
+    sobject = str(params.get("sobject_name", "") or "").strip()
+    if sobject:
+        return sobject
+    return call_llm_resolve_sobject(prompt).strip()
 
 
-def _extract_from_object(soql: str) -> str | None:
-    match = re.search(r"\bFROM\s+([A-Za-z0-9_]+)", soql, flags=re.IGNORECASE)
-    return match.group(1) if match else None
+def _prompt_needs_custom_where(prompt: str) -> bool:
+    text = prompt.lower()
+    if any(word in text for word in ("show all", "list all", "all ", "every ")):
+        return False
+    return any(
+        word in text
+        for word in (
+            " where ",
+            " in ",
+            " with ",
+            " named ",
+            " called ",
+            " from ",
+            " before ",
+            " after ",
+            " greater ",
+            " less ",
+            " equal ",
+            " like ",
+            " status",
+            " stage",
+            " industry",
+            " city",
+            " state",
+            " country",
+            " owner",
+            " closed",
+            " open",
+        )
+    )
+
+
+def _merge_where_clause(base_soql: str, custom_soql: str, sobject: str) -> str:
+    match = re.search(
+        r"\bWHERE\b(.+?)(?:\s+ORDER\s+BY|\s+LIMIT|\s*$)",
+        custom_soql,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return base_soql
+    where_body = match.group(1).strip().rstrip(";")
+    if not where_body or where_body.lower().replace(" ", "") == "id!=null":
+        return base_soql
+    select_match = re.match(
+        rf"(?is)\s*SELECT\s+.+?\s+FROM\s+{re.escape(sobject)}\s+",
+        base_soql,
+    )
+    if not select_match:
+        return base_soql
+    limit_match = re.search(r"\bLIMIT\s+(\d+)\s*$", base_soql, flags=re.IGNORECASE)
+    limit_clause = limit_match.group(0) if limit_match else f"LIMIT {settings.salesforce_soql_row_limit}"
+    prefix = base_soql[: select_match.end()].rstrip()
+    return f"{prefix} WHERE {where_body} {limit_clause}".strip()
 
 
 def generate_soql(prompt: str, intent: str, params: dict) -> tuple[str, str]:
     action = str(params.get("action_hint", "query")).lower()
-    sobject = str(params.get("sobject_name", "") or "").strip() or infer_sobject_from_prompt(
-        prompt
-    )
+    sobject = _resolve_sobject(prompt, params)
 
     if action in ("create", "update", "delete"):
         return _generate_sf_operation(prompt, action, sobject)
@@ -102,53 +108,41 @@ def generate_soql(prompt: str, intent: str, params: dict) -> tuple[str, str]:
     if action == "schema":
         return f"DESCRIBE {sobject}" if sobject else "DESCRIBE ALL", "Deterministic:schema"
 
-    limit = settings.salesforce_soql_row_limit
-    object_hints = get_salesforce_schema_hint(sobject_name=sobject)
-    llm_prompt = (
-        f"{prompt}\n\n"
-        f"Target object: {sobject or 'infer from prompt'}.\n"
-        "Return one SOQL SELECT only. Must include WHERE and LIMIT."
-    )
+    if not sobject:
+        raise ValueError(
+            "Could not determine a Salesforce object for this prompt. "
+            "Mention the object (e.g. Account, Opportunity) and try again."
+        )
 
-    last_soql = ""
-    for attempt in range(3):
+    base_soql = build_query_soql(sobject)
+    model = f"MCP-schema:{sobject}"
+
+    if _prompt_needs_custom_where(prompt):
+        from backend.mcp.schema_discovery import get_salesforce_schema_hint
+
+        field_names = fetch_sobject_field_names(sobject)
+        hints = get_salesforce_schema_hint(sobject_name=sobject)
+        if field_names:
+            hints = f"{hints} Fields: {', '.join(field_names[:40])}"
         llm_soql = call_llm_for_soql(
-            prompt=llm_prompt,
-            object_hints=object_hints,
+            prompt=prompt,
+            object_hints=hints,
             action=action,
             sobject_name=sobject,
         )
         sanitized = _sanitize_soql(llm_soql)
-        last_soql = sanitized
-
         if _is_valid_soql(sanitized):
-            limited = _ensure_soql_limit(sanitized)
-            return ensure_mcp_soql(limited), f"LLM:{settings.llm_provider}"
+            merged = _merge_where_clause(base_soql, ensure_mcp_soql(sanitized), sobject)
+            return ensure_mcp_soql(merged), f"LLM:{settings.llm_provider}"
 
-        llm_prompt = (
-            f"{prompt}\n\nPrevious invalid SOQL: {sanitized}\n"
-            f"Return valid SOQL: SELECT fields FROM {sobject or 'Object'} "
-            f"WHERE Id != null LIMIT {limit}. No markdown."
-        )
-
-    if sobject:
-        fallback = _template_soql(sobject)
-        if fallback:
-            return ensure_mcp_soql(fallback), f"Template:{sobject}"
-
-    if last_soql and _extract_from_object(last_soql):
-        return ensure_mcp_soql(_ensure_soql_limit(last_soql)), f"LLM:{settings.llm_provider}:retry"
-
-    raise ValueError(
-        f"Could not generate valid SOQL. Last attempt: {last_soql}. "
-        f"Try: 'Show {sobject or 'Account'} records in Salesforce'."
-    )
+    return ensure_mcp_soql(base_soql), model
 
 
 def _generate_sf_operation(
     prompt: str, action: str, sobject: str
 ) -> tuple[str, str]:
     from backend.model.llm_clients import call_llm_for_sf_operation
+    from backend.mcp.schema_discovery import get_salesforce_schema_hint
 
     result = call_llm_for_sf_operation(
         prompt=prompt,

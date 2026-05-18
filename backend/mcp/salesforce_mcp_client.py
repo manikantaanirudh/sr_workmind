@@ -316,8 +316,9 @@ def _build_soql_arguments(soql: str) -> dict[str, Any]:
     clean = ensure_mcp_soql(soql)
     if not clean:
         raise RuntimeError("SOQL is empty. Rephrase your Salesforce question.")
-    sf_mcp_tools_list()
-    return {_soql_arg_key: clean, "query": clean}
+    if _sf_tools_cache is None:
+        sf_mcp_tools_list()
+    return {_soql_arg_key: clean}
 
 
 def _tool_result_has_payload(result: dict[str, Any]) -> bool:
@@ -368,7 +369,11 @@ def sf_mcp_tools_call(
 
 def _invoke_soql_query(soql: str) -> dict[str, Any]:
     args = _build_soql_arguments(soql)
-    return sf_mcp_tools_call(_soql_tool_name, args, read_timeout=60.0)
+    return sf_mcp_tools_call(
+        _soql_tool_name,
+        args,
+        read_timeout=float(settings.salesforce_mcp_timeout_sec),
+    )
 
 
 def _records_to_table(records: list[dict[str, Any]]) -> tuple[list[str], list[list[Any]]]:
@@ -388,7 +393,10 @@ def _records_to_table(records: list[dict[str, Any]]) -> tuple[list[str], list[li
     return columns, rows
 
 
-def execute_soql_via_mcp(soql: str) -> tuple[list[str], list[list[Any]]]:
+def execute_soql_via_mcp(soql: str, *, fresh_session: bool = True) -> tuple[list[str], list[list[Any]]]:
+    """Run soqlQuery on the hosted MCP server (fresh session avoids stale-session hangs)."""
+    if fresh_session:
+        _reset_sf_session()
     clean = ensure_mcp_soql(soql)
     logger.info("Salesforce soqlQuery: %s", clean[:250])
     result = _invoke_soql_query(clean)
