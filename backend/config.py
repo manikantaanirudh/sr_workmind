@@ -155,7 +155,7 @@ _SF_MCP_SANDBOX_SOBJECT_ALL = (
 
 
 def _is_sandbox_salesforce_instance(instance_url: str) -> bool:
-    """Detect scratch/sandbox orgs (must use /sandbox/ MCP base URL per Salesforce docs)."""
+    """Scratch + full sandbox orgs use the /sandbox/ hosted MCP path (Salesforce docs)."""
     inst = instance_url.lower()
     return any(
         marker in inst
@@ -169,19 +169,33 @@ def _is_sandbox_salesforce_instance(instance_url: str) -> bool:
     )
 
 
+def _is_full_sandbox_salesforce_instance(instance_url: str) -> bool:
+    """Full copy sandboxes log in at test.salesforce.com (not scratch orgs)."""
+    inst = instance_url.lower()
+    return any(
+        marker in inst
+        for marker in (
+            ".sandbox.my.salesforce.com",
+            "--sandbox",
+        )
+    )
+
+
 def resolve_salesforce_oauth_base_url(instance_url: str = "") -> str:
     """OAuth authorize/token host (not the My Domain instance URL).
 
-    Scratch/sandbox orgs must use test.salesforce.com — instance URLs like
-    *.develop.my.salesforce.com return 404 on /services/oauth2/authorize.
-    See: https://developer.salesforce.com/docs/platform/hosted-mcp-servers/guide/create-external-client-app.html
+    - Production + scratch orgs (*.develop.my.salesforce.com): login.salesforce.com
+    - Full sandboxes (*.sandbox.my.salesforce.com): test.salesforce.com
+
+    Scratch org credentials do NOT work on test.salesforce.com.
+  Do not use the instance My Domain URL for /oauth2/authorize (often 404).
     """
     override = os.getenv("SALESFORCE_OAUTH_BASE_URL", "").strip().rstrip("/")
     if override:
         return override
 
     inst = (instance_url or settings.salesforce_instance_url).strip().rstrip("/")
-    if inst and _is_sandbox_salesforce_instance(inst):
+    if inst and _is_full_sandbox_salesforce_instance(inst):
         return "https://test.salesforce.com"
     return "https://login.salesforce.com"
 
