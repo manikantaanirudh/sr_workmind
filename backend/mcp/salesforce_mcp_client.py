@@ -17,7 +17,11 @@ from typing import Any
 
 import httpx
 
-from backend.config import resolve_salesforce_mcp_server_url, settings
+from backend.config import (
+    _SF_MCP_PROD_SOBJECT_ALL,
+    resolve_salesforce_mcp_server_url,
+    settings,
+)
 from backend.mcp.mcp_protocol import decode_rpc_response, decode_sse_stream
 from backend.mcp.salesforce_oauth import get_valid_access_token
 
@@ -142,6 +146,8 @@ def _sf_auth_headers(*, include_session: bool = True) -> dict[str, str]:
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
         "Accept": SF_MCP_ACCEPT,
+        # Avoid gzip/br decode errors on Render (incorrect header check).
+        "Accept-Encoding": "identity",
         "Mcp-Protocol-Version": MCP_PROTOCOL_VERSION,
     }
     if include_session and _sf_session_id:
@@ -149,20 +155,12 @@ def _sf_auth_headers(*, include_session: bool = True) -> dict[str, str]:
     return headers
 
 
-def _read_mcp_http_response(response: httpx.Response) -> dict[str, Any]:
-    """Decode Salesforce MCP JSON or SSE response without waiting for stream close."""
+def _decode_mcp_response(response: httpx.Response) -> dict[str, Any]:
+    """Decode Salesforce MCP JSON or SSE response body."""
     content_type = response.headers.get("content-type", "").lower()
     if "text/event-stream" in content_type:
         return decode_sse_stream(response)
-    body = response.read()
-    if not body.strip():
-        return {}
-    wrapped = httpx.Response(
-        status_code=response.status_code,
-        content=body,
-        headers=response.headers,
-    )
-    return decode_rpc_response(wrapped)
+    return decode_rpc_response(response)
 
 
 def _sf_jsonrpc_request(
@@ -222,34 +220,32 @@ def _ensure_session(client: httpx.Client, url: str) -> None:
         },
         request_id=9999,
     )
-    with client.stream(
-        "POST",
+    response = client.post(
         url,
         headers=_sf_auth_headers(include_session=False),
         json=init_payload,
         timeout=_sf_timeout(init_timeout),
-    ) as response:
-        if response.status_code == 401:
-            raise RuntimeError(
-                "Salesforce MCP authentication failed (401). Reconnect at /auth/salesforce."
-            )
-        if response.status_code not in {200, 202}:
-            body = response.read().decode("utf-8", errors="replace")
-            raise RuntimeError(
-                f"Failed to initialize Salesforce MCP session ({response.status_code}): "
-                f"{body[:300]}"
-            )
-
-        _sf_session_id = response.headers.get("mcp-session-id") or response.headers.get(
-            "Mcp-Session-Id"
+    )
+    if response.status_code == 401:
+        raise RuntimeError(
+            "Salesforce MCP authentication failed (401). Reconnect at /auth/salesforce."
         )
-        if not _sf_session_id:
-            raise RuntimeError(
-                "Salesforce MCP initialize succeeded but no Mcp-Session-Id header was returned."
-            )
+    if response.status_code not in {200, 202}:
+        raise RuntimeError(
+            f"Failed to initialize Salesforce MCP session ({response.status_code}): "
+            f"{response.text[:300]}"
+        )
 
-        _sf_session_url = url
-        init_data = _read_mcp_http_response(response)
+    _sf_session_id = response.headers.get("mcp-session-id") or response.headers.get(
+        "Mcp-Session-Id"
+    )
+    if not _sf_session_id:
+        raise RuntimeError(
+            "Salesforce MCP initialize succeeded but no Mcp-Session-Id header was returned."
+        )
+
+    _sf_session_url = url
+    init_data = _decode_mcp_response(response)
     if init_data.get("error"):
         err = init_data["error"]
         raise RuntimeError(
@@ -282,37 +278,39 @@ def _sf_send_rpc(
         with httpx.Client(timeout=timeout, follow_redirects=True, verify=False) as client:
             _ensure_session(client, mcp_url)
             headers = _sf_auth_headers()
-            logger.info("SF MCP RPC -> %s method=%s", mcp_url, payload.get("method"))
-            with client.stream(
-                "POST",
+            logger.info(
+                "SF MCP RPC -> %s method=%s params=%s",
+                mcp_url,
+                payload.get("method"),
+                json.dumps(payload.get("params", {}))[:400],
+            )
+            response = client.post(
                 mcp_url,
                 headers=headers,
                 json=payload,
                 timeout=timeout,
-            ) as response:
-                if response.status_code == 401:
-                    raise RuntimeError(
-                        "Salesforce MCP Server authentication failed (401). "
-                        "Reconnect at /auth/salesforce."
-                    )
-                if response.status_code == 403:
-                    raise RuntimeError(
-                        "Salesforce MCP Server access denied (403). "
-                        "Check External Client App and user permissions."
-                    )
-                if response.status_code == 406:
-                    body = response.read().decode("utf-8", errors="replace")
-                    raise RuntimeError(
-                        f"Salesforce MCP HTTP 406: {body[:500]}. "
-                        f"Accept header must be: {SF_MCP_ACCEPT}"
-                    )
-                if response.status_code not in {200, 202}:
-                    body = response.read().decode("utf-8", errors="replace")
-                    raise RuntimeError(
-                        f"Salesforce MCP HTTP {response.status_code}: {body[:500]}"
-                    )
+            )
+            if response.status_code == 401:
+                raise RuntimeError(
+                    "Salesforce MCP Server authentication failed (401). "
+                    "Reconnect at /auth/salesforce."
+                )
+            if response.status_code == 403:
+                raise RuntimeError(
+                    "Salesforce MCP Server access denied (403). "
+                    "Check External Client App and user permissions."
+                )
+            if response.status_code == 406:
+                raise RuntimeError(
+                    f"Salesforce MCP HTTP 406: {response.text[:500]}. "
+                    f"Accept header must be: {SF_MCP_ACCEPT}"
+                )
+            if response.status_code not in {200, 202}:
+                raise RuntimeError(
+                    f"Salesforce MCP HTTP {response.status_code}: {response.text[:500]}"
+                )
 
-                data = _read_mcp_http_response(response)
+            data = _decode_mcp_response(response)
 
     except httpx.ReadTimeout as exc:
         _reset_sf_session()
@@ -385,24 +383,109 @@ def _build_sf_tool_arguments(tool_name: str, value_map: dict[str, Any]) -> dict[
     return {k: v for k, v in value_map.items() if v is not None}
 
 
+def _resolve_soql_tool_name() -> str:
+    for tool in sf_mcp_tools_list():
+        name = str(tool.get("name", ""))
+        if name.lower() in ("soqlquery", "soql_query"):
+            return name
+    return "soqlQuery"
+
+
+def _soql_argument_variants(soql: str) -> list[dict[str, Any]]:
+    """Build argument shapes for soqlQuery (schema-driven + documented fallbacks)."""
+    clean = ensure_mcp_soql(soql)
+    if not clean.strip():
+        raise RuntimeError("SOQL query is empty. Rephrase your Salesforce question.")
+
+    variants: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add(args: dict[str, Any]) -> None:
+        key = json.dumps(args, sort_keys=True)
+        if key not in seen:
+            seen.add(key)
+            variants.append(args)
+
+    tools = _sf_tools_cache if _sf_tools_cache is not None else sf_mcp_tools_list()
+    for tool in tools:
+        name = str(tool.get("name", "")).lower()
+        if name not in ("soqlquery", "soql_query"):
+            continue
+        schema = tool.get("inputSchema") or {}
+        props = schema.get("properties") or {}
+        required = schema.get("required") or []
+        for prop in list(required) + list(props.keys()):
+            add({prop: clean})
+        break
+
+    add({"query": clean})
+    add({"soql": clean})
+    add({"input": {"query": clean}})
+    add({"query": clean, "soql": clean})
+    return variants
+
+
+def _tools_call_param_variants(tool_name: str, arguments: dict[str, Any]) -> list[dict[str, Any]]:
+    """Some gateways expect arguments nested; others accept query alongside name."""
+    variants: list[dict[str, Any]] = [{"name": tool_name, "arguments": arguments}]
+    if tool_name == "soqlQuery" and arguments.get("query"):
+        q = arguments["query"]
+        variants.append({"name": tool_name, "arguments": arguments, "query": q})
+        variants.append({"name": tool_name, "query": q})
+    return variants
+
+
 def sf_mcp_tools_call(
     tool_name: str,
     arguments: dict[str, Any],
     *,
     read_timeout: float | None = None,
+    mcp_url: str | None = None,
 ) -> dict[str, Any]:
-    payload = _sf_jsonrpc_request(
-        "tools/call",
-        params={"name": tool_name, "arguments": arguments},
-    )
-    result = _sf_send_rpc(payload, read_timeout=read_timeout)
+    last_error: RuntimeError | None = None
+    for params in _tools_call_param_variants(tool_name, arguments):
+        payload = _sf_jsonrpc_request("tools/call", params=params)
+        try:
+            result = _sf_send_rpc(payload, read_timeout=read_timeout, url=mcp_url)
+        except RuntimeError as exc:
+            last_error = exc
+            continue
 
-    if result.get("isError"):
-        content = result.get("content", [])
-        error_text = content[0].get("text", "Unknown error") if content else "Unknown error"
-        raise RuntimeError(f"Salesforce MCP tool '{tool_name}' error: {error_text}")
+        if result.get("isError"):
+            content = result.get("content", [])
+            error_text = content[0].get("text", "Unknown error") if content else "Unknown error"
+            last_error = RuntimeError(
+                f"Salesforce MCP tool '{tool_name}' error: {error_text}"
+            )
+            if "empty or null" in error_text.lower() or "MALFORMED_QUERY" in error_text:
+                continue
+            raise last_error
+        return result
 
-    return result
+    if last_error:
+        raise last_error
+    raise RuntimeError(f"Salesforce MCP tool '{tool_name}' failed with no response.")
+
+
+def _invoke_soql_query(soql: str) -> dict[str, Any]:
+    tool_name = _resolve_soql_tool_name()
+    mcp_urls = [_mcp_url()]
+    if mcp_urls[0] != _SF_MCP_PROD_SOBJECT_ALL and "/sandbox/" in mcp_urls[0]:
+        mcp_urls.append(_SF_MCP_PROD_SOBJECT_ALL)
+
+    last_error: RuntimeError | None = None
+    for mcp_url in mcp_urls:
+        for args in _soql_argument_variants(soql):
+            try:
+                return sf_mcp_tools_call(tool_name, args, mcp_url=mcp_url)
+            except RuntimeError as exc:
+                last_error = exc
+                err = str(exc).lower()
+                if "empty or null" not in err and "malformed_query" not in err:
+                    raise
+    if last_error:
+        raise last_error
+    raise RuntimeError("Salesforce soqlQuery failed.")
 
 
 def _records_to_table(records: list[dict[str, Any]]) -> tuple[list[str], list[list[Any]]]:
@@ -425,10 +508,8 @@ def _records_to_table(records: list[dict[str, Any]]) -> tuple[list[str], list[li
 def execute_soql_via_mcp(soql: str) -> tuple[list[str], list[list[Any]]]:
     """Execute SOQL via hosted MCP soqlQuery tool only."""
     clean_soql = ensure_mcp_soql(soql)
-    tool_name = "soqlQuery"
-    arguments = {"query": clean_soql}
-    logger.info("Salesforce MCP tools/call -> %s query=%s", tool_name, clean_soql[:120])
-    result = sf_mcp_tools_call(tool_name, arguments)
+    logger.info("Salesforce MCP soqlQuery -> %s", clean_soql[:200])
+    result = _invoke_soql_query(clean_soql)
     return _parse_sf_tool_result(result)
 
 
