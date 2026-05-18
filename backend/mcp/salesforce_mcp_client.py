@@ -1,11 +1,8 @@
 """
 MCP Client for Salesforce's Hosted MCP Server.
 
-Communicates with Salesforce's Hosted MCP Server via JSON-RPC 2.0 over HTTPS,
-following the Model Context Protocol specification.
-
-Authentication: Uses OAuth 2.0 Bearer tokens obtained via the PKCE flow
-managed by salesforce_oauth.py.
+Communicates with Salesforce's Hosted MCP Server via JSON-RPC 2.0 over HTTPS.
+OAuth via salesforce_oauth.py; SOQL via soqlQuery tools/call.
 """
 
 from __future__ import annotations
@@ -17,34 +14,23 @@ from typing import Any
 
 import httpx
 
-from backend.config import (
-    _SF_MCP_PROD_SOBJECT_ALL,
-    resolve_salesforce_mcp_server_url,
-    settings,
-)
+from backend.config import resolve_salesforce_mcp_server_url, settings
 from backend.mcp.mcp_protocol import decode_rpc_response, decode_sse_stream
 from backend.mcp.salesforce_oauth import get_valid_access_token
 
 logger = logging.getLogger(__name__)
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
-# Required by Salesforce hosted MCP (HTTP 406 if either is missing).
 SF_MCP_ACCEPT = "application/json, text/event-stream"
 SF_CONNECTOR_LABEL = "Salesforce Hosted MCP Server (platform/sobject-all)"
 
 _sf_session_id: str | None = None
 _sf_session_url: str | None = None
 _sf_tools_cache: list[dict] | None = None
+_soql_tool_name: str = "soqlQuery"
+_soql_arg_key: str = "query"
 
-_DEFAULT_SF_TOOLS: list[dict] = [
-    {"name": "soqlQuery"},
-    {"name": "getObjectSchema"},
-    {"name": "getUserInfo"},
-    {"name": "createSobjectRecord"},
-    {"name": "updateSobjectRecord"},
-    {"name": "deleteSobjectRecord"},
-    {"name": "find"},
-]
+_DEFAULT_SF_TOOLS: list[dict] = [{"name": "soqlQuery"}, {"name": "getUserInfo"}]
 
 
 def get_salesforce_connector_label() -> str:
@@ -54,8 +40,9 @@ def get_salesforce_connector_label() -> str:
 def ensure_mcp_soql(soql: str) -> str:
     """Salesforce soqlQuery requires WHERE and LIMIT (hosted MCP reference)."""
     clean = soql.strip().rstrip(";")
+    if not clean:
+        return ""
     upper = f" {clean.upper()} "
-
     if not upper.strip().startswith("SELECT"):
         return clean
 
@@ -89,64 +76,15 @@ def _mcp_url() -> str:
     return resolve_salesforce_mcp_server_url(instance)
 
 
-def probe_salesforce_connectivity() -> dict[str, Any]:
-    """MCP-only probe for /health/diagnostics."""
-    from backend.mcp.salesforce_oauth import auth_status, get_instance_url, is_authenticated
-
-    url = _mcp_url()
-    out: dict[str, Any] = {
-        "mcp_server_url": url,
-        "mcp_server_url_env": settings.salesforce_mcp_server_url.strip(),
-        "mcp_timeout_sec": settings.salesforce_mcp_timeout_sec,
-        "mcp_init_timeout_sec": settings.salesforce_mcp_init_timeout_sec,
-        "soql_row_limit": settings.salesforce_soql_row_limit,
-    }
-    if not is_authenticated():
-        out["mcp_soql_query"] = "skipped (not authenticated)"
-        return out
-
-    out["oauth"] = auth_status()
-    try:
-        from backend.config import resolve_salesforce_oauth_base_url
-
-        inst = get_instance_url()
-        out["instance_url"] = inst
-        out["oauth_base_url"] = resolve_salesforce_oauth_base_url(inst)
-        out["mcp_org_tier"] = "sandbox" if "/sandbox/" in url else "production"
-    except RuntimeError:
-        out["instance_url"] = None
-
-    try:
-        result = sf_mcp_tools_call("getUserInfo", {}, read_timeout=25.0)
-        out["mcp_get_user_info"] = "ok"
-        content = result.get("content", [])
-        if content and content[0].get("text"):
-            out["mcp_user_hint"] = content[0]["text"][:120]
-    except Exception as exc:
-        out["mcp_get_user_info"] = f"error: {exc}"
-
-    try:
-        cols, rows = execute_soql_via_mcp(
-            "SELECT Id, Name FROM Account WHERE Id != null LIMIT 1"
-        )
-        out["mcp_soql_query"] = f"ok ({len(rows)} row(s), {len(cols)} col(s))"
-    except Exception as exc:
-        out["mcp_soql_query"] = f"error: {exc}"
-
-    return out
-
-
 def _sf_timeout(read_sec: float) -> httpx.Timeout:
     return httpx.Timeout(connect=20.0, read=read_sec, write=30.0, pool=20.0)
 
 
 def _sf_auth_headers(*, include_session: bool = True) -> dict[str, str]:
-    access_token = get_valid_access_token()
     headers = {
-        "Authorization": f"Bearer {access_token}",
+        "Authorization": f"Bearer {get_valid_access_token()}",
         "Content-Type": "application/json",
         "Accept": SF_MCP_ACCEPT,
-        # Avoid gzip/br decode errors on Render (incorrect header check).
         "Accept-Encoding": "identity",
         "Mcp-Protocol-Version": MCP_PROTOCOL_VERSION,
     }
@@ -156,7 +94,6 @@ def _sf_auth_headers(*, include_session: bool = True) -> dict[str, str]:
 
 
 def _decode_mcp_response(response: httpx.Response) -> dict[str, Any]:
-    """Decode Salesforce MCP JSON or SSE response body."""
     content_type = response.headers.get("content-type", "").lower()
     if "text/event-stream" in content_type:
         return decode_sse_stream(response)
@@ -178,39 +115,57 @@ def _sf_jsonrpc_request(
     return payload
 
 
-def _send_initialized(client: httpx.Client, url: str) -> None:
-    payload = {"jsonrpc": "2.0", "method": "notifications/initialized"}
-    timeout = _sf_timeout(float(settings.salesforce_mcp_init_timeout_sec))
-    response = client.post(
-        url,
-        headers=_sf_auth_headers(),
-        json=payload,
-        timeout=timeout,
-    )
-    if response.status_code not in {200, 202, 204}:
-        logger.warning(
-            "Salesforce MCP notifications/initialized returned %s: %s",
-            response.status_code,
-            response.text[:200],
-        )
-
-
 def _reset_sf_session() -> None:
     global _sf_session_id, _sf_session_url
     _sf_session_id = None
     _sf_session_url = None
 
 
+def _update_soql_tool_meta(tools: list[dict]) -> None:
+    """Cache soqlQuery tool name + argument key from tools/list inputSchema."""
+    global _soql_tool_name, _soql_arg_key
+    for tool in tools:
+        name = str(tool.get("name", ""))
+        if "soql" not in name.lower() or "query" not in name.lower():
+            continue
+        _soql_tool_name = name
+        schema = tool.get("inputSchema") or tool.get("input_schema") or {}
+        if not isinstance(schema, dict):
+            continue
+        required = schema.get("required") or []
+        props = schema.get("properties") or {}
+        if required and isinstance(required[0], str):
+            _soql_arg_key = required[0]
+        elif isinstance(props, dict) and props:
+            _soql_arg_key = next(iter(props.keys()))
+        logger.info(
+            "Salesforce soql tool=%s arg_key=%s schema_props=%s",
+            _soql_tool_name,
+            _soql_arg_key,
+            list(props.keys()) if isinstance(props, dict) else [],
+        )
+        return
+
+
+def _send_initialized(client: httpx.Client, url: str) -> None:
+    payload = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+    client.post(
+        url,
+        headers=_sf_auth_headers(),
+        json=payload,
+        timeout=_sf_timeout(float(settings.salesforce_mcp_init_timeout_sec)),
+    )
+
+
 def _ensure_session(client: httpx.Client, url: str) -> None:
-    global _sf_session_id, _sf_session_url
+    global _sf_session_id, _sf_session_url, _sf_tools_cache
     if _sf_session_id and _sf_session_url == url:
         return
 
     if _sf_session_url != url:
         _reset_sf_session()
+        _sf_tools_cache = None
 
-    init_timeout = float(settings.salesforce_mcp_init_timeout_sec)
-    logger.info("Initializing Salesforce MCP session at %s", url)
     init_payload = _sf_jsonrpc_request(
         "initialize",
         params={
@@ -224,7 +179,7 @@ def _ensure_session(client: httpx.Client, url: str) -> None:
         url,
         headers=_sf_auth_headers(include_session=False),
         json=init_payload,
-        timeout=_sf_timeout(init_timeout),
+        timeout=_sf_timeout(float(settings.salesforce_mcp_init_timeout_sec)),
     )
     if response.status_code == 401:
         raise RuntimeError(
@@ -240,21 +195,36 @@ def _ensure_session(client: httpx.Client, url: str) -> None:
         "Mcp-Session-Id"
     )
     if not _sf_session_id:
-        raise RuntimeError(
-            "Salesforce MCP initialize succeeded but no Mcp-Session-Id header was returned."
-        )
+        raise RuntimeError("Salesforce MCP initialize missing Mcp-Session-Id header.")
 
     _sf_session_url = url
     init_data = _decode_mcp_response(response)
     if init_data.get("error"):
         err = init_data["error"]
         raise RuntimeError(
-            f"Salesforce MCP initialize error ({err.get('code', 'unknown')}): "
-            f"{err.get('message', 'Unknown error')}"
+            f"Salesforce MCP initialize error: {err.get('message', 'Unknown')}"
         )
 
-    logger.info("Salesforce MCP session id acquired")
     _send_initialized(client, url)
+
+    # Refresh tool catalog once per session (learn soqlQuery argument name).
+    try:
+        list_payload = _sf_jsonrpc_request("tools/list", request_id=2)
+        list_resp = client.post(
+            url,
+            headers=_sf_auth_headers(),
+            json=list_payload,
+            timeout=_sf_timeout(25.0),
+        )
+        if list_resp.status_code in {200, 202}:
+            list_data = _decode_mcp_response(list_resp)
+            result = list_data.get("result", list_data)
+            tools = result.get("tools", []) if isinstance(result, dict) else []
+            if tools:
+                _sf_tools_cache = tools
+                _update_soql_tool_meta(tools)
+    except Exception as exc:
+        logger.warning("Salesforce tools/list during init skipped: %s", exc)
 
 
 def _sf_send_rpc(
@@ -264,11 +234,7 @@ def _sf_send_rpc(
     read_timeout: float | None = None,
     url: str | None = None,
 ) -> dict[str, Any]:
-    """POST JSON-RPC to Salesforce hosted MCP (Streamable HTTP + SSE-safe read)."""
     mcp_url = (url or _mcp_url()).strip()
-    if not mcp_url:
-        raise RuntimeError("Salesforce MCP server URL is not configured.")
-
     read_sec = read_timeout if read_timeout is not None else float(
         settings.salesforce_mcp_timeout_sec
     )
@@ -277,41 +243,21 @@ def _sf_send_rpc(
     try:
         with httpx.Client(timeout=timeout, follow_redirects=True, verify=False) as client:
             _ensure_session(client, mcp_url)
-            headers = _sf_auth_headers()
-            logger.info(
-                "SF MCP RPC -> %s method=%s params=%s",
-                mcp_url,
-                payload.get("method"),
-                json.dumps(payload.get("params", {}))[:400],
-            )
             response = client.post(
                 mcp_url,
-                headers=headers,
+                headers=_sf_auth_headers(),
                 json=payload,
                 timeout=timeout,
             )
             if response.status_code == 401:
                 raise RuntimeError(
-                    "Salesforce MCP Server authentication failed (401). "
-                    "Reconnect at /auth/salesforce."
-                )
-            if response.status_code == 403:
-                raise RuntimeError(
-                    "Salesforce MCP Server access denied (403). "
-                    "Check External Client App and user permissions."
-                )
-            if response.status_code == 406:
-                raise RuntimeError(
-                    f"Salesforce MCP HTTP 406: {response.text[:500]}. "
-                    f"Accept header must be: {SF_MCP_ACCEPT}"
+                    "Salesforce MCP authentication failed (401). Reconnect at /auth/salesforce."
                 )
             if response.status_code not in {200, 202}:
                 raise RuntimeError(
                     f"Salesforce MCP HTTP {response.status_code}: {response.text[:500]}"
                 )
-
             data = _decode_mcp_response(response)
-
     except httpx.ReadTimeout as exc:
         _reset_sf_session()
         raise RuntimeError(
@@ -320,31 +266,24 @@ def _sf_send_rpc(
         ) from exc
     except httpx.TimeoutException as exc:
         _reset_sf_session()
-        raise RuntimeError(
-            f"Salesforce MCP connection timed out: {exc}. "
-            "Check network access to api.salesforce.com."
-        ) from exc
+        raise RuntimeError(f"Salesforce MCP connection timed out: {exc}") from exc
 
     if "error" in data:
         err = data["error"]
         raise RuntimeError(
-            f"Salesforce MCP error (code={err.get('code', 'unknown')}): "
-            f"{err.get('message', 'Unknown Salesforce MCP error')}"
+            f"Salesforce MCP error (code={err.get('code')}): {err.get('message')}"
         )
 
     result = data.get("result", data)
-    if isinstance(result, dict) and result.get("isError"):
+    if isinstance(result, dict) and result.get("isError") and retry:
         content = result.get("content", [])
-        error_text = content[0].get("text", "") if content else "Unknown error"
-        if "Unexpected error" in error_text and retry:
-            logger.info("Salesforce MCP session expired; retrying once")
+        error_text = content[0].get("text", "") if content else ""
+        if "Unexpected error" in error_text:
             _reset_sf_session()
-            new_payload = _sf_jsonrpc_request(
-                str(payload.get("method", "")),
-                payload.get("params") if isinstance(payload.get("params"), dict) else None,
-            )
+            method = str(payload.get("method", ""))
+            params = payload.get("params") if isinstance(payload.get("params"), dict) else None
             return _sf_send_rpc(
-                new_payload,
+                _sf_jsonrpc_request(method, params),
                 retry=False,
                 read_timeout=read_sec,
                 url=mcp_url,
@@ -361,78 +300,36 @@ def sf_mcp_tools_list(force_refresh: bool = False) -> list[dict]:
     try:
         payload = _sf_jsonrpc_request("tools/list")
         response = _sf_send_rpc(payload, read_timeout=25.0)
-        tools: list[dict] = []
-        if isinstance(response, dict):
-            tools = response.get("tools", [])
+        tools = response.get("tools", []) if isinstance(response, dict) else []
+        if tools:
+            _sf_tools_cache = tools
+            _update_soql_tool_meta(tools)
+            return tools
+    except Exception as exc:
+        logger.warning("Salesforce tools/list failed: %s", exc)
 
-        if not tools:
-            tools = list(_DEFAULT_SF_TOOLS)
-    except (RuntimeError, httpx.TimeoutException) as exc:
-        logger.warning("Salesforce tools/list unavailable (%s); using defaults.", exc)
-        tools = list(_DEFAULT_SF_TOOLS)
-
-    _sf_tools_cache = tools
-    return tools
+    _sf_tools_cache = list(_DEFAULT_SF_TOOLS)
+    return _sf_tools_cache
 
 
-def _build_sf_tool_arguments(tool_name: str, value_map: dict[str, Any]) -> dict[str, Any]:
-    if tool_name == "soqlQuery" and "query" in value_map:
-        return {"query": value_map["query"]}
-    if tool_name == "find" and value_map.get("search"):
-        return {"search": value_map["search"]}
-    return {k: v for k, v in value_map.items() if v is not None}
-
-
-def _resolve_soql_tool_name() -> str:
-    for tool in sf_mcp_tools_list():
-        name = str(tool.get("name", ""))
-        if name.lower() in ("soqlquery", "soql_query"):
-            return name
-    return "soqlQuery"
-
-
-def _soql_argument_variants(soql: str) -> list[dict[str, Any]]:
-    """Build argument shapes for soqlQuery (schema-driven + documented fallbacks)."""
+def _build_soql_arguments(soql: str) -> dict[str, Any]:
     clean = ensure_mcp_soql(soql)
-    if not clean.strip():
-        raise RuntimeError("SOQL query is empty. Rephrase your Salesforce question.")
-
-    variants: list[dict[str, Any]] = []
-    seen: set[str] = set()
-
-    def add(args: dict[str, Any]) -> None:
-        key = json.dumps(args, sort_keys=True)
-        if key not in seen:
-            seen.add(key)
-            variants.append(args)
-
-    tools = _sf_tools_cache if _sf_tools_cache is not None else sf_mcp_tools_list()
-    for tool in tools:
-        name = str(tool.get("name", "")).lower()
-        if name not in ("soqlquery", "soql_query"):
-            continue
-        schema = tool.get("inputSchema") or {}
-        props = schema.get("properties") or {}
-        required = schema.get("required") or []
-        for prop in list(required) + list(props.keys()):
-            add({prop: clean})
-        break
-
-    add({"query": clean})
-    add({"soql": clean})
-    add({"input": {"query": clean}})
-    add({"query": clean, "soql": clean})
-    return variants
+    if not clean:
+        raise RuntimeError("SOQL is empty. Rephrase your Salesforce question.")
+    sf_mcp_tools_list()
+    return {_soql_arg_key: clean, "query": clean}
 
 
-def _tools_call_param_variants(tool_name: str, arguments: dict[str, Any]) -> list[dict[str, Any]]:
-    """Some gateways expect arguments nested; others accept query alongside name."""
-    variants: list[dict[str, Any]] = [{"name": tool_name, "arguments": arguments}]
-    if tool_name == "soqlQuery" and arguments.get("query"):
-        q = arguments["query"]
-        variants.append({"name": tool_name, "arguments": arguments, "query": q})
-        variants.append({"name": tool_name, "query": q})
-    return variants
+def _tool_result_has_payload(result: dict[str, Any]) -> bool:
+    """True when MCP returned a parseable tool body (including zero records)."""
+    if result.get("isError"):
+        return False
+    if isinstance(result.get("structuredContent"), dict):
+        return True
+    for item in result.get("content", []):
+        if isinstance(item, dict) and str(item.get("text", "")).strip():
+            return True
+    return False
 
 
 def sf_mcp_tools_call(
@@ -440,52 +337,38 @@ def sf_mcp_tools_call(
     arguments: dict[str, Any],
     *,
     read_timeout: float | None = None,
-    mcp_url: str | None = None,
 ) -> dict[str, Any]:
-    last_error: RuntimeError | None = None
-    for params in _tools_call_param_variants(tool_name, arguments):
-        payload = _sf_jsonrpc_request("tools/call", params=params)
-        try:
-            result = _sf_send_rpc(payload, read_timeout=read_timeout, url=mcp_url)
-        except RuntimeError as exc:
-            last_error = exc
-            continue
+    if not arguments and tool_name == _soql_tool_name:
+        raise RuntimeError("Refusing soqlQuery with empty arguments.")
 
-        if result.get("isError"):
-            content = result.get("content", [])
-            error_text = content[0].get("text", "Unknown error") if content else "Unknown error"
-            last_error = RuntimeError(
-                f"Salesforce MCP tool '{tool_name}' error: {error_text}"
-            )
-            if "empty or null" in error_text.lower() or "MALFORMED_QUERY" in error_text:
-                continue
-            raise last_error
-        return result
+    payload = _sf_jsonrpc_request(
+        "tools/call",
+        params={"name": tool_name, "arguments": arguments},
+    )
+    logger.info(
+        "SF tools/call %s args=%s",
+        tool_name,
+        json.dumps(arguments)[:300],
+    )
+    result = _sf_send_rpc(payload, read_timeout=read_timeout)
 
-    if last_error:
-        raise last_error
-    raise RuntimeError(f"Salesforce MCP tool '{tool_name}' failed with no response.")
+    if result.get("isError"):
+        content = result.get("content", [])
+        error_text = content[0].get("text", "Unknown error") if content else "Unknown error"
+        raise RuntimeError(f"Salesforce MCP tool '{tool_name}' error: {error_text}")
+
+    if tool_name == _soql_tool_name and not _tool_result_has_payload(result):
+        raise RuntimeError(
+            "Salesforce soqlQuery returned an empty MCP payload. "
+            "SOQL may not have been passed to the server."
+        )
+
+    return result
 
 
 def _invoke_soql_query(soql: str) -> dict[str, Any]:
-    tool_name = _resolve_soql_tool_name()
-    mcp_urls = [_mcp_url()]
-    if mcp_urls[0] != _SF_MCP_PROD_SOBJECT_ALL and "/sandbox/" in mcp_urls[0]:
-        mcp_urls.append(_SF_MCP_PROD_SOBJECT_ALL)
-
-    last_error: RuntimeError | None = None
-    for mcp_url in mcp_urls:
-        for args in _soql_argument_variants(soql):
-            try:
-                return sf_mcp_tools_call(tool_name, args, mcp_url=mcp_url)
-            except RuntimeError as exc:
-                last_error = exc
-                err = str(exc).lower()
-                if "empty or null" not in err and "malformed_query" not in err:
-                    raise
-    if last_error:
-        raise last_error
-    raise RuntimeError("Salesforce soqlQuery failed.")
+    args = _build_soql_arguments(soql)
+    return sf_mcp_tools_call(_soql_tool_name, args, read_timeout=60.0)
 
 
 def _records_to_table(records: list[dict[str, Any]]) -> tuple[list[str], list[list[Any]]]:
@@ -506,25 +389,18 @@ def _records_to_table(records: list[dict[str, Any]]) -> tuple[list[str], list[li
 
 
 def execute_soql_via_mcp(soql: str) -> tuple[list[str], list[list[Any]]]:
-    """Execute SOQL via hosted MCP soqlQuery tool only."""
-    clean_soql = ensure_mcp_soql(soql)
-    logger.info("Salesforce MCP soqlQuery -> %s", clean_soql[:200])
-    result = _invoke_soql_query(clean_soql)
+    clean = ensure_mcp_soql(soql)
+    logger.info("Salesforce soqlQuery: %s", clean[:250])
+    result = _invoke_soql_query(clean)
     return _parse_sf_tool_result(result)
 
 
 def execute_sf_search(search_query: str) -> tuple[list[str], list[list[Any]]]:
-    tool_name = "find"
-    arguments = _build_sf_tool_arguments(
-        tool_name,
-        {
-            "search": search_query,
-            "query": search_query,
-            "q": search_query,
-            "sosl": search_query,
-        },
+    result = sf_mcp_tools_call(
+        "find",
+        {"search": search_query},
+        read_timeout=60.0,
     )
-    result = sf_mcp_tools_call(tool_name, arguments)
     return _parse_sf_tool_result(result)
 
 
@@ -532,17 +408,11 @@ def create_sf_record(sobject_name: str, fields: dict[str, Any]) -> tuple[list[st
     from backend.mcp.tool_registry import resolve_salesforce_tool
 
     tool_name = resolve_salesforce_tool("createSobjectRecord", "create_sobject_record")
-    arguments = _build_sf_tool_arguments(
+    result = sf_mcp_tools_call(
         tool_name,
-        {
-            "sobject-name": sobject_name,
-            "sobject_name": sobject_name,
-            "object": sobject_name,
-            "body": fields,
-            "fields": fields,
-        },
+        {"sobject-name": sobject_name, "body": fields},
+        read_timeout=60.0,
     )
-    result = sf_mcp_tools_call(tool_name, arguments)
     content = result.get("content", [])
     if content:
         text = content[0].get("text", "")
@@ -561,18 +431,11 @@ def update_sf_record(
     from backend.mcp.tool_registry import resolve_salesforce_tool
 
     tool_name = resolve_salesforce_tool("updateSobjectRecord", "update_sobject_record")
-    arguments = _build_sf_tool_arguments(
+    sf_mcp_tools_call(
         tool_name,
-        {
-            "sobject-name": sobject_name,
-            "sobject_name": sobject_name,
-            "id": record_id,
-            "record_id": record_id,
-            "body": fields,
-            "fields": fields,
-        },
+        {"sobject-name": sobject_name, "id": record_id, "body": fields},
+        read_timeout=60.0,
     )
-    sf_mcp_tools_call(tool_name, arguments)
     return ["status"], [["Record updated successfully."]]
 
 
@@ -580,16 +443,11 @@ def delete_sf_record(sobject_name: str, record_id: str) -> tuple[list[str], list
     from backend.mcp.tool_registry import resolve_salesforce_tool
 
     tool_name = resolve_salesforce_tool("deleteSobjectRecord", "delete_sobject_record")
-    arguments = _build_sf_tool_arguments(
+    sf_mcp_tools_call(
         tool_name,
-        {
-            "sobject-name": sobject_name,
-            "sobject_name": sobject_name,
-            "id": record_id,
-            "record_id": record_id,
-        },
+        {"sobject-name": sobject_name, "id": record_id},
+        read_timeout=60.0,
     )
-    sf_mcp_tools_call(tool_name, arguments)
     return ["status"], [["Record deleted successfully."]]
 
 
@@ -597,42 +455,83 @@ def get_sf_schema(object_name: str = "") -> tuple[list[str], list[list[Any]]]:
     from backend.mcp.tool_registry import resolve_salesforce_tool
 
     tool_name = resolve_salesforce_tool("getObjectSchema", "get_object_schema")
-    value_map: dict[str, Any] = {}
+    args: dict[str, Any] = {}
     if object_name:
-        value_map.update(
-            {
-                "object-name": object_name,
-                "object_name": object_name,
-                "object": object_name,
-                "sobject": object_name,
-            }
-        )
-    arguments = _build_sf_tool_arguments(tool_name, value_map)
-    result = sf_mcp_tools_call(tool_name, arguments)
+        args["object-name"] = object_name
+    result = sf_mcp_tools_call(tool_name, args, read_timeout=45.0)
     return _parse_sf_tool_result(result)
 
 
-def _parse_sf_tool_result(result: dict[str, Any]) -> tuple[list[str], list[list[Any]]]:
-    content_list = result.get("content", [])
-    if not content_list:
-        return ["status"], [["Operation completed successfully."]]
+def probe_salesforce_connectivity() -> dict[str, Any]:
+    from backend.config import resolve_salesforce_oauth_base_url
+    from backend.mcp.salesforce_oauth import auth_status, get_instance_url, is_authenticated
 
-    for item in content_list:
-        item_type = item.get("type", "text")
-        if item_type == "text":
+    url = _mcp_url()
+    out: dict[str, Any] = {
+        "mcp_server_url": url,
+        "soql_tool": _soql_tool_name,
+        "soql_arg_key": _soql_arg_key,
+        "mcp_timeout_sec": settings.salesforce_mcp_timeout_sec,
+    }
+    if not is_authenticated():
+        out["mcp_soql_query"] = "skipped (not authenticated)"
+        return out
+
+    out["oauth"] = auth_status()
+    try:
+        inst = get_instance_url()
+        out["instance_url"] = inst
+        out["oauth_base_url"] = resolve_salesforce_oauth_base_url(inst)
+    except RuntimeError:
+        pass
+
+    try:
+        sf_mcp_tools_call("getUserInfo", {}, read_timeout=25.0)
+        out["mcp_get_user_info"] = "ok"
+    except Exception as exc:
+        out["mcp_get_user_info"] = f"error: {exc}"
+
+    probe_soql = (
+        f"SELECT Id, Name FROM Account WHERE Id != null "
+        f"LIMIT {min(5, settings.salesforce_soql_row_limit)}"
+    )
+    try:
+        cols, rows = execute_soql_via_mcp(probe_soql)
+        out["mcp_soql_query"] = f"ok ({len(rows)} row(s), cols={cols[:6]})"
+        out["mcp_probe_soql"] = probe_soql[:200]
+    except Exception as exc:
+        out["mcp_soql_query"] = f"error: {exc}"
+        out["mcp_probe_soql"] = probe_soql[:200]
+
+    return out
+
+
+def _parse_sf_tool_result(result: dict[str, Any]) -> tuple[list[str], list[list[Any]]]:
+    structured = result.get("structuredContent")
+    if isinstance(structured, dict):
+        records = structured.get("records")
+        if isinstance(records, list):
+            return _records_to_table(records)
+        if "columns" in structured and "rows" in structured:
+            return structured["columns"], structured["rows"]
+        data = structured.get("data")
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            columns = list(data[0].keys())
+            rows = [[row.get(c) for c in columns] for row in data]
+            return columns, rows
+
+    for item in result.get("content", []):
+        if item.get("type") == "text":
             text = item.get("text", "")
             parsed = _try_parse_sf_result(text)
             if parsed:
                 return parsed
-            return ["result"], [[text]]
-        if item_type == "resource":
-            resource = item.get("resource", {})
-            text = resource.get("text", "")
-            parsed = _try_parse_sf_result(text)
-            if parsed:
-                return parsed
+            if text.strip():
+                return ["result"], [[text[:2000]]]
 
-    return ["status"], [["Operation completed."]]
+    raise RuntimeError(
+        "Salesforce MCP returned an empty result. The query may have failed silently."
+    )
 
 
 def _try_parse_sf_result(text: str) -> tuple[list[str], list[list[Any]]] | None:
@@ -650,12 +549,6 @@ def _try_parse_sf_result(text: str) -> tuple[list[str], list[list[Any]]] | None:
         skip_keys = {"attributes"}
         columns = [k for k in data[0].keys() if k not in skip_keys]
         rows = [[row.get(col) for col in columns] for row in data]
-        return columns, rows
-
-    if isinstance(data, dict):
-        skip_keys = {"attributes"}
-        columns = [k for k in data.keys() if k not in skip_keys]
-        rows = [[data.get(col) for col in columns]]
         return columns, rows
 
     return None

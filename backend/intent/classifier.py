@@ -322,10 +322,13 @@ def _build_intent_payload(
         }
 
     if platform == "salesforce":
+        from backend.model.salesforce_sql_generator import infer_sobject_from_prompt
+
         sf_action = action_hint if action_hint != "auto" else _infer_sf_action(prompt)
         params: dict[str, Any] = {"action_hint": sf_action}
-        if sobject_name:
-            params["sobject_name"] = sobject_name
+        resolved_sobject = sobject_name.strip() or infer_sobject_from_prompt(prompt)
+        if resolved_sobject:
+            params["sobject_name"] = resolved_sobject
         return {
             "platform": "salesforce",
             "action": sf_action,
