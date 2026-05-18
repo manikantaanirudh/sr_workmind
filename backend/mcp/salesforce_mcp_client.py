@@ -15,7 +15,7 @@ from typing import Any
 import httpx
 
 from backend.config import resolve_salesforce_mcp_server_url, settings
-from backend.mcp.mcp_protocol import decode_rpc_response, decode_sse_stream
+from backend.mcp.mcp_protocol import decode_rpc_response
 from backend.mcp.salesforce_oauth import get_valid_access_token
 
 logger = logging.getLogger(__name__)
@@ -27,6 +27,7 @@ SF_CONNECTOR_LABEL = "Salesforce Hosted MCP Server (platform/sobject-all)"
 _sf_session_id: str | None = None
 _sf_session_url: str | None = None
 _sf_tools_cache: list[dict] | None = None
+_sf_http_client: httpx.Client | None = None
 _soql_tool_name: str = "soqlQuery"
 _soql_arg_key: str = "query"
 
@@ -94,10 +95,20 @@ def _sf_auth_headers(*, include_session: bool = True) -> dict[str, str]:
 
 
 def _decode_mcp_response(response: httpx.Response) -> dict[str, Any]:
-    content_type = response.headers.get("content-type", "").lower()
-    if "text/event-stream" in content_type:
-        return decode_sse_stream(response)
+    """Decode MCP HTTP body (JSON or SSE). Always buffer the full body first."""
     return decode_rpc_response(response)
+
+
+def _get_sf_http_client() -> httpx.Client:
+    """Reuse one HTTP client per worker (connection pooling to api.salesforce.com)."""
+    global _sf_http_client
+    if _sf_http_client is None or _sf_http_client.is_closed:
+        _sf_http_client = httpx.Client(
+            follow_redirects=True,
+            verify=False,
+            timeout=httpx.Timeout(connect=20.0, read=120.0, write=30.0, pool=20.0),
+        )
+    return _sf_http_client
 
 
 def _sf_jsonrpc_request(
@@ -240,26 +251,36 @@ def _sf_send_rpc(
     )
     timeout = _sf_timeout(read_sec)
 
+    client = _get_sf_http_client()
     try:
-        with httpx.Client(timeout=timeout, follow_redirects=True, verify=False) as client:
-            _ensure_session(client, mcp_url)
-            response = client.post(
-                mcp_url,
-                headers=_sf_auth_headers(),
-                json=payload,
-                timeout=timeout,
+        _ensure_session(client, mcp_url)
+        response = client.post(
+            mcp_url,
+            headers=_sf_auth_headers(),
+            json=payload,
+            timeout=timeout,
+        )
+        if response.status_code == 401:
+            raise RuntimeError(
+                "Salesforce MCP authentication failed (401). Reconnect at /auth/salesforce."
             )
-            if response.status_code == 401:
-                raise RuntimeError(
-                    "Salesforce MCP authentication failed (401). Reconnect at /auth/salesforce."
-                )
-            if response.status_code not in {200, 202}:
-                raise RuntimeError(
-                    f"Salesforce MCP HTTP {response.status_code}: {response.text[:500]}"
-                )
-            data = _decode_mcp_response(response)
+        if response.status_code not in {200, 202}:
+            raise RuntimeError(
+                f"Salesforce MCP HTTP {response.status_code}: {response.text[:500]}"
+            )
+        logger.debug(
+            "SF MCP %s status=%s ctype=%s bytes=%s",
+            payload.get("method"),
+            response.status_code,
+            response.headers.get("content-type"),
+            len(response.content or b""),
+        )
+        data = _decode_mcp_response(response)
     except httpx.ReadTimeout as exc:
         _reset_sf_session()
+        if retry:
+            logger.warning("Salesforce MCP read timeout; retrying once with fresh session.")
+            return _sf_send_rpc(payload, retry=False, read_timeout=read_sec, url=mcp_url)
         raise RuntimeError(
             f"Salesforce MCP request timed out after {read_sec:.0f}s. "
             "Retry once, or reconnect at /auth/salesforce if the session expired."
@@ -393,8 +414,8 @@ def _records_to_table(records: list[dict[str, Any]]) -> tuple[list[str], list[li
     return columns, rows
 
 
-def execute_soql_via_mcp(soql: str, *, fresh_session: bool = True) -> tuple[list[str], list[list[Any]]]:
-    """Run soqlQuery on the hosted MCP server (fresh session avoids stale-session hangs)."""
+def execute_soql_via_mcp(soql: str, *, fresh_session: bool = False) -> tuple[list[str], list[list[Any]]]:
+    """Run soqlQuery on the hosted MCP server."""
     if fresh_session:
         _reset_sf_session()
     clean = ensure_mcp_soql(soql)
@@ -493,8 +514,9 @@ def probe_salesforce_connectivity() -> dict[str, Any]:
     except RuntimeError:
         pass
 
+    _reset_sf_session()
     try:
-        sf_mcp_tools_call("getUserInfo", {}, read_timeout=25.0)
+        sf_mcp_tools_call("getUserInfo", {}, read_timeout=45.0)
         out["mcp_get_user_info"] = "ok"
     except Exception as exc:
         out["mcp_get_user_info"] = f"error: {exc}"
@@ -504,7 +526,7 @@ def probe_salesforce_connectivity() -> dict[str, Any]:
         f"LIMIT {min(5, settings.salesforce_soql_row_limit)}"
     )
     try:
-        cols, rows = execute_soql_via_mcp(probe_soql)
+        cols, rows = execute_soql_via_mcp(probe_soql, fresh_session=False)
         out["mcp_soql_query"] = f"ok ({len(rows)} row(s), cols={cols[:6]})"
         out["mcp_probe_soql"] = probe_soql[:200]
     except Exception as exc:

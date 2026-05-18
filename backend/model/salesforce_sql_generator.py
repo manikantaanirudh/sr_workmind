@@ -8,7 +8,7 @@ import re
 
 from backend.config import settings
 from backend.mcp.salesforce_mcp_client import ensure_mcp_soql
-from backend.mcp.salesforce_schema import build_query_soql, fetch_sobject_field_names
+from backend.mcp.salesforce_schema import build_query_soql
 from backend.model.llm_clients import call_llm_for_soql, call_llm_resolve_sobject
 
 
@@ -120,10 +120,7 @@ def generate_soql(prompt: str, intent: str, params: dict) -> tuple[str, str]:
     if _prompt_needs_custom_where(prompt):
         from backend.mcp.schema_discovery import get_salesforce_schema_hint
 
-        field_names = fetch_sobject_field_names(sobject)
         hints = get_salesforce_schema_hint(sobject_name=sobject)
-        if field_names:
-            hints = f"{hints} Fields: {', '.join(field_names[:40])}"
         llm_soql = call_llm_for_soql(
             prompt=prompt,
             object_hints=hints,

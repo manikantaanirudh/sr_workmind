@@ -175,13 +175,23 @@ def pick_query_columns(field_names: list[str], *, max_columns: int = _MAX_SELECT
     return picked[:max_columns]
 
 
-def build_query_soql(sobject: str, field_names: list[str] | None = None) -> str:
+def build_query_soql(
+    sobject: str,
+    field_names: list[str] | None = None,
+    *,
+    fetch_schema: bool = False,
+) -> str:
     """Build a bounded SELECT for hosted MCP soqlQuery (WHERE + LIMIT required)."""
     clean = sobject.strip()
     if not clean:
         raise ValueError("Salesforce object name is required.")
 
-    fields = field_names if field_names is not None else fetch_sobject_field_names(clean)
+    if field_names is not None:
+        fields = field_names
+    elif fetch_schema:
+        fields = fetch_sobject_field_names(clean)
+    else:
+        fields = ["Id", "Name"]
     columns = pick_query_columns(fields)
     limit = settings.salesforce_soql_row_limit
     return (

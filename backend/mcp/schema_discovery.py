@@ -106,27 +106,10 @@ def get_salesforce_schema_hint(
             return cached
 
     if sobject_name:
-        try:
-            from backend.mcp.salesforce_schema import fetch_sobject_field_names
-
-            fields = fetch_sobject_field_names(sobject_name)
-            if fields:
-                hint = (
-                    f"Target object: {sobject_name}. "
-                    f"Queryable fields: {', '.join(fields[:50])}. "
-                    f"Always include WHERE and LIMIT {settings.salesforce_soql_row_limit}."
-                )
-            else:
-                hint = (
-                    f"Target object: {sobject_name}. Use valid API field names. "
-                    f"LIMIT {settings.salesforce_soql_row_limit}."
-                )
-        except Exception as exc:
-            logger.warning("Salesforce schema via MCP failed for %s: %s", sobject_name, exc)
-            hint = (
-                f"Target object: {sobject_name}. Use valid API field names. "
-                f"LIMIT {settings.salesforce_soql_row_limit}."
-            )
+        hint = (
+            f"Target object: {sobject_name}. Use valid API field names (Id, Name, etc.). "
+            f"Always include WHERE and LIMIT {settings.salesforce_soql_row_limit}."
+        )
     else:
         hint = (
             "Use valid Salesforce object and field API names per the authenticated user. "
